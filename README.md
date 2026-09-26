@@ -47,6 +47,6 @@ uv run --locked python -m unittest discover -s anime-pv/scripts/tests -v
 
 仓库 CI 在 macOS、Linux、Windows 上执行结构检查和离线测试；以具体运行结果为准。离线测试不代表真实 API 调用成功或成片画质已验收。
 
-## 许可状态
+## 开源许可
 
-尚未指定开源许可证。仓库公开不等于授予开源许可；许可证选择由维护者另行决定。
+本项目的代码、技能指令、模板和文档采用 [MIT License](LICENSE)，允许使用、修改、分发及商业使用，分发时保留版权和许可声明。可独立安装的技能目录内也包含 [许可证副本](anime-pv/LICENSE)。第三方依赖及用户提供的素材遵循各自的许可。
