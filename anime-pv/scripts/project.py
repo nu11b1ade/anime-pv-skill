@@ -23,13 +23,13 @@ def init_project(root, mode):
         raise ValueError('HANDOFF.md already exists; resume it instead of overwriting.')
     template = (SKILL / 'assets/HANDOFF.template.md').read_text(encoding='utf-8')
     template = template.replace('项目：待填写', '项目：' + root.name).replace('模式：待填写', '模式：' + mode)
-    for name in ('inputs', 'assets', 'design', 'previews', 'render', 'deliverables', 'state/history'):
+    for name in ('inputs', 'assets', 'design', 'previews', 'render', 'deliverables', 'state/history', 'tmp', '.cache'):
         (root / name).mkdir(parents=True, exist_ok=True)
     with target.open('x', encoding='utf-8') as handle:
         handle.write(template)
     ignore = root / '.gitignore'
     old = ignore.read_text(encoding='utf-8') if ignore.exists() else ''
-    rules = ['.env', '.env.*', '!.env.example', '.image-jobs/', '.venv/', '__pycache__/']
+    rules = ['.env', '.env.*', '!.env.example', '.image-jobs/', '.venv/', '__pycache__/', '/tmp/', '/.cache/']
     with ignore.open('a', encoding='utf-8') as handle:
         handle.write('\n' + '\n'.join(r for r in rules if r not in old.splitlines()) + '\n')
     return {'handoff': str(target), 'stage': 1, 'approved': False}

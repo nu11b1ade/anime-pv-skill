@@ -27,7 +27,9 @@ def config(protocol='openai', **extra):
 
 class ToolsTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        scratch = Path(__file__).resolve().parents[3] / 'tmp'
+        scratch.mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=scratch)
         self.root = Path(self.temp.name)
         self.project, self.skill, self.home = [self.root / name for name in ('project', 'skill', 'home')]
         for path in (self.project, self.skill, self.home / '.anime-pv'):
@@ -180,7 +182,12 @@ class ToolsTest(unittest.TestCase):
             send.assert_not_called()
 
     def test_init_and_package_portable_files(self):
+        (self.project / '.gitignore').write_text('user-rule\n', encoding='utf-8')
         p.init_project(self.project, 'replica')
+        for name in ('tmp', '.cache'):
+            self.assertTrue((self.project / name).is_dir())
+        rules = (self.project / '.gitignore').read_text(encoding='utf-8').splitlines()
+        self.assertTrue({'user-rule', '/tmp/', '/.cache/'}.issubset(rules))
         with self.assertRaises(ValueError):
             p.init_project(self.project, 'original')
         manifest = self.project / 'state/package-files.txt'
