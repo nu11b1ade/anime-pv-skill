@@ -1,0 +1,4 @@
+interface:
+  display_name: "二次元 PV 制作"
+  short_description: "不使用视频生成模型，分阶段完成二次元 PV 复刻、创作与工程交接"
+  default_prompt: "使用 $anime-pv 制作二次元 PV；若有 HANDOFF.md，先从交接入口恢复项目。"
