@@ -14,3 +14,7 @@ htmlcov/
 dist/
 /tmp/
 /.cache/
+
+# Local live-generation evidence; curated findings live in docs/.
+/backend-test-20260927/
+/builtin-test-20260927/

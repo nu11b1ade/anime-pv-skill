@@ -34,7 +34,7 @@
 
 `unknown` 在 POST 前落盘。成功获得异步 ID 后转为 `pending`；同步结果或查询成功后转为 `download`，保存文件与哈希后为 `complete`。失败或无法解析有效输出记为 `failed`（某些网络/响应错误保留 unknown）。恢复 unknown/failed 不会再次 POST。
 
-`job.json` 保存任务 ID、后端绑定与状态，`results.private.json` 临时保存下载结果（可能含签名 URL），下载完成删除。任务缓存不可作为交付素材的唯一位置。最终采用的图片必须复制到版本化 assets。
+`job.json` 保存任务 ID、后端绑定与状态，`results.private.json` 临时保存下载结果（可能含签名 URL），下载完成删除。新任务另存expected、实际图片属性和validation；complete只代表落盘完成，needs_review不触发重新提交。first_diagnostic保留首次错误，diagnostic更新最近实际请求错误；本地拒绝恢复不覆盖已有诊断。两者仅包含安全类别、请求阶段和HTTP状态，不保存原始异常或响应。旧任务不回填未知的原始期望。任务缓存不可作为交付素材的唯一位置。最终采用的图片必须复制到版本化 assets。
 
 ## 改动影响面
 

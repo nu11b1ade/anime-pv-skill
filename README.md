@@ -28,7 +28,7 @@ Python 使用 [uv](https://docs.astral.sh/uv/)。先运行只读环境检查：
 uv run anime-pv/scripts/project.py preflight
 ```
 
-生图途径需由用户明确选择：agent 内置生图或后端 API。首批适配 OpenAI Images 原生及兼容协议、Gemini、火山方舟 Seedream、阿里百炼/万相、MiniMax。能力因协议及模型而异，详见 [后端配置与限制](anime-pv/references/image-backends.md)。
+生图途径需由用户明确选择：agent 内置生图或后端 API。适配 OpenAI Images 原生及兼容协议、Gemini、火山方舟 Seedream、阿里百炼/万相多模态路径。三方中转应具备文生图、单图参考、多参考合成和指令编辑；详情见 [中转选择建议](anime-pv/references/gateway-guidance.md)。能力因协议及模型而异，详见 [后端配置与限制](anime-pv/references/image-backends.md)。
 
 默认不运行本地 AI 模型，不固定唯一渲染引擎。仅有 API key 不代表已经获得生图途径选择。项目素材和真实配置应放在独立项目目录。
 

@@ -2,6 +2,12 @@
 
 仅首次需要生图时读取本文件。用户先明确选择内置生图或后端 API；选择写入交接，项目内沿用。内置工具不可用时报告，不自行切换 API；反之亦然。后端、端点或协议更换同样不能擅自进行。
 
+## 选择之前
+
+先读 [三方中转与最低能力建议](gateway-guidance.md)。完整创作路径至少需要文生图、单图参考、两张以上参考合成与指令编辑；协议名或模型名不能代替实测。精确尺寸、原生透明和独立mask按项目需求验证，不把内置同样存在的规格偏差当作模型画质不足。
+
+已移除 MiniMax 主体参考适配，以及 DashScope synthesis/edit 旧 profile：这些旧路径只覆盖角色参考、纯文生图或单图编辑，不满足此skill完整创作路径的多参考与通用编辑要求。这是适配范围取舍，不是对整个厂商能力的评价。旧配置不会自动切换；MiniMax旧任务请用原版本检查/取回，已保存图片可继续使用。DashScope旧任务在原配置下仍可resume查询/下载，只有新建旧profile任务被拒绝；新项目明确选择新profile和对应模型。
+
 ## 配置查找
 
 脚本依次读取项目根目录 `.env` → skill 根目录 `.env` → `~/.anime-pv/.env`（Windows 为用户主目录中的 `.anime-pv`）。首个含 `ANIME_PV_` 配置的文件为完整来源；缺项即报错，无关 `.env` 继续查找。不合并文件、不从进程环境补 key、不展开变量。复制 [配置模板](../assets/backend.env.example) 并填写，真实 `.env` 不进入版本库或交付包。
@@ -13,19 +19,18 @@
 | openai | `https://api.openai.com/v1` 或用户兼容服务基址 | JSON 文生图；multipart 参考图/编辑、可选 mask；兼容服务须实际支持 Images 协议，不能只支持 chat/completions |
 | gemini | `https://generativelanguage.googleapis.com/v1beta` | generateContent；本地图像 inlineData；文字指令编辑；不支持显式 mask、Vertex 鉴权或服务端多轮会话续接 |
 | seedream | `https://ark.cn-beijing.volces.com/api/v3` | images/generations；参考图与指令编辑按所选模型能力；不支持显式 mask |
-| dashscope | `https://dashscope.aliyuncs.com/api/v1` 或账户地域/业务空间基址 | 下表四个 API profile，地区与 key 必须匹配 |
-| minimax | `https://api.minimax.io/v1` 或账户地域基址 | image_generation；文生图或单张角色主体参考；不承诺通用编辑，edit 明确拒绝 |
+| dashscope | `https://dashscope.aliyuncs.com/api/v1` 或账户地域/业务空间基址 | 下表两个 API profile，地区与 key 必须匹配 |
 
-DashScope 用 `ANIME_PV_DASHSCOPE_API` 明确选择，不按模型名猜：
+DashScope 必须用 `ANIME_PV_DASHSCOPE_API` 明确选择，没有默认 profile，不按模型名猜：
 
 | profile | 请求类型 | 模型/能力示例（不是可用性保证） |
 | --- | --- | --- |
-| synthesis（默认） | 异步 text2image/image-synthesis | Wan 文生图 V2；仅 generate |
-| edit | 异步 image2image/image-synthesis | wanx2.1-imageedit；单图指令编辑、mask；params.input.function 可选择支持的原生功能 |
-| multimodal | 同步 multimodal-generation/generation | wan2.6-image 等对应模型；图像输入 messages |
-| multimodal-async | 异步 image-generation/generation | 支持该异步 API 的模型；任务查询 |
+| multimodal | 同步 multimodal-generation/generation | wan2.6-image 仅支持1–4张参考图的生成/编辑，不能单独作为完整路径 |
+| multimodal-async | 异步 image-generation/generation | wan2.6-image 支持纯文本混排生图及1–4张参考编辑；结果只保存图片 |
 
-接口支持不等于每个模型支持所有操作。尺寸、图数、格式、区域与配额限制按所选模型官方文档核对。脚本不支持流式或图文混排输出；不支持的模型能力应报告，不能降级或更换后端冒充成功。
+接口支持不等于每个模型支持所有操作。尺寸、图数、格式、区域与配额限制按所选模型官方文档核对。脚本不支持流式输出；仅为wan2.6-image异步接口支持混排结果的图片提取，文本不保存；不支持的模型能力应报告，不能降级或更换后端冒充成功。
+
+对于`wan2.6-image + multimodal-async`，generate自动设置`enable_interleave=true,n=1,max_images=1`，用户显式参数优先但必须符合协议。`max_images`是数量上限，不是精确图数。reference/edit默认非混排、输入1–4张图；显式开启混排时最多1张图。同步profile的纯文本请求在本地拒绝，不自动切换profile或模型。选择完整万相路径时应明确配置multimodal-async；尚未真实账户验证。
 
 ## 调用
 
@@ -53,19 +58,28 @@ uv run <skill>/scripts/image_backend.py --project <项目> --check
 {"operation":"edit","prompt":"保持已批准角色身份，仅调整指定姿态","images":["assets/character-v1.png"],"mask":"assets/mask-v1.png","params":{}}
 ```
 
-mask 仅用于 OpenAI 编辑与 DashScope edit；其余平台省略。MiniMax 用 reference。OpenAI/Gemini 的 images 接收本地文件；其余也接收 HTTPS URL 或 data URI。脚本不擅自上传素材到图床。
+mask 仅用于 OpenAI 编辑；其余平台省略。OpenAI/Gemini 的 images 接收本地文件；其余也接收 HTTPS URL 或 data URI。脚本不擅自上传素材到图床。
 
-Gemini 原生参数示例为 `{"generationConfig":{"imageConfig":{"aspectRatio":"16:9"}}}`；DashScope 为 `{"parameters":{"size":"1024*1024","n":1}}`；Seedream 为 `{"size":"2K"}`；MiniMax 为 `{"aspect_ratio":"16:9","n":1}`。这些值需匹配具体模型。
+Gemini 原生参数示例为 `{"generationConfig":{"imageConfig":{"aspectRatio":"16:9"}}}`；DashScope 为 `{"parameters":{"size":"1024*1024","n":1}}`；Seedream 为 `{"size":"2K"}`。这些值需匹配具体模型。
 
 ```sh
 uv run <skill>/scripts/image_backend.py --project <项目> --request <项目>/state/request-v1.json --job .image-jobs/character-v1
 uv run <skill>/scripts/image_backend.py --project <项目> --job .image-jobs/character-v1 --resume
 ```
 
+OpenAI 多参考图使用标准重复 `image[]` 字段，上传文件自动分配唯一ASCII名称，避免不同目录同名素材在中转层冲突；不会改动本地原图。
+
 每次新提交使用全新 job 目录。轮询默认约 40 秒后返回 pending，agent 更新进展后用 resume 查询；单次网络请求仍可能超过此时长。同步生图可能耗时数分钟。将最终选用图片复制到版本化 assets 路径，记录提示词、非敏感模型参数及 job ID；交接不依赖缓存。已完成任务 resume 会校验输出哈希。
+
+## 输出验收
+
+`status=complete` 只表示图片已落盘。新任务另存 `validation`：`checks_passed` 表示已知机械检查通过，`needs_review` 表示图数、精确尺寸或要求的透明度未满足；无论哪种都需视觉验收。`files` 记录实际宽高、格式、alpha范围、透明像素比例和哈希。脚本只比较可识别的原生参数（size的像素格式、n、background），不会从提示词推断尺寸，也不将2K等档位误当精确像素。
+
+规格偏差不触发重新付费生成，不自动裁切、拉伸或强制修改alpha。agent应报告实际规格，在项目合成层按构图选择等比适配、留边或用户认可的裁切，保留原图。alpha最高254本身不是失败；局部改色和mask仍需核对角色与保护区域，不能只凭像素不相同就判画质不合格。旧已完成任务resume保留原状态，没有validation时不能宣称它通过新检查；旧待下载/异步任务没有原始expected，完成后标为not_checked，不猜测原始规格。
 
 ## 错误恢复与秘密边界
 
+- `job.json` 的 `diagnostic` 记录脱敏错误类别、POST/GET、poll-response或download阶段和可用的HTTP状态；区分读超时、连接异常、无效JSON与服务报错，不记录原始异常、响应体、鉴权头或端点。`first_diagnostic`保留首次诊断，`diagnostic`更新为最近一次实际请求错误；本地拒绝resume不会覆盖已有诊断。
 - POST 只提交一次。网络中断、超时或响应损坏时，任务记为 unknown；先查账户后台，不能自动重发。修复后确需重新提交，用新 job 并说明可能重复计费。
 - 异步任务 ID 在开始查询前落盘。pending 可恢复；failed/canceled/unknown 不自动重生。GET 短暂错误最多三次有限重试。
 - 下载失败保留私有结果缓存；resume 只重下结果，不再 POST。临时 URL 可能过期，过期后先查询任务；同步接口无任务查询则报告限制，不能承诺永久恢复。
@@ -74,12 +88,11 @@ uv run <skill>/scripts/image_backend.py --project <项目> --job .image-jobs/cha
 
 ## 官方协议依据
 
-2026-09-26 核对。模型和服务可能变动，遇到能力或协议不符先查官方文档；不把这些链接整篇加载进上下文。
+2026-09-27 复核 OpenAI、Gemini、万相与 MiniMax 文档；Seedream 文档本轮页面未完整加载，保留既有适配，未新增真实验证。模型和服务可能变动，遇到能力或协议不符先查官方文档；不把这些链接整篇加载进上下文。
 
 - [OpenAI Images 编辑接口](https://developers.openai.com/api/reference/resources/images/methods/edit)
 - [Gemini 图像生成](https://ai.google.dev/gemini-api/docs/image-generation)
 - [火山方舟图像生成 API](https://docs.volcengine.com/docs/ark/image-generation-api?lang=en)
 - [万相文生图 V2](https://help.aliyun.com/zh/model-studio/text-to-image-v2-api-reference)、[图像编辑](https://help.aliyun.com/zh/model-studio/wanx-image-edit-api-reference)、[图像生成与编辑](https://help.aliyun.com/zh/model-studio/wan-image-generation-api-reference)
-- [MiniMax 角色参考生图](https://platform.minimax.io/docs/api-reference/image-generation-i2i)
 
 实际验证状态见 [验证记录](validation.md)。离线协议测试不能替代账户、地区、模型与真实输出质量验证。

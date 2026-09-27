@@ -8,6 +8,7 @@ import base64
 import hashlib
 import io
 import json
+import re
 import time
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -18,11 +19,19 @@ from PIL import Image
 
 SKILL = Path(__file__).resolve().parents[1]
 PREFIX = 'ANIME_PV_'
-PROTOCOLS = {'openai', 'gemini', 'seedream', 'dashscope', 'minimax'}
+PROTOCOLS = {'openai', 'gemini', 'seedream', 'dashscope'}
 
 
 class BackendError(Exception):
     """Safe user-facing error; excludes raw response bodies and credentials."""
+
+    def __init__(self, message, *, category='backend', stage=None, http_status=None):
+        super().__init__(message)
+        self.diagnostic = {'category': category}
+        if stage:
+            self.diagnostic['stage'] = stage
+        if http_status is not None:
+            self.diagnostic['http_status'] = http_status
 
 
 def read_json(path):
@@ -108,8 +117,26 @@ def merge(base, extra):
     return result
 
 
+def request_params(config, spec):
+    extra = spec.get('params', {})
+    if not isinstance(extra, dict):
+        raise BackendError('params must be an object.')
+    extra = merge(config['PARAMS'], extra)
+    if config['PROTOCOL'] == 'dashscope':
+        native = extra.get('parameters', {})
+        if not isinstance(native, dict):
+            raise BackendError('parameters must be an object.')
+        if (config['MODEL'] == 'wan2.6-image'
+                and config.get('DASHSCOPE_API') == 'multimodal-async'
+                and spec.get('operation', 'generate') == 'generate'):
+            extra['parameters'] = {'enable_interleave': True, 'n': 1, 'max_images': 1, **native}
+    return extra
+
+
 def build_request(config, spec, project):
     protocol, endpoint = config['PROTOCOL'], config['ENDPOINT']
+    if protocol not in PROTOCOLS:
+        raise BackendError('Unsupported/retired protocol; choose a backend with multi-image references and instruction edits.')
     operation = spec.get('operation', 'generate')
     if operation not in ('generate', 'reference', 'edit'):
         raise BackendError('Operation must be generate, reference, or edit.')
@@ -121,20 +148,21 @@ def build_request(config, spec, project):
         raise BackendError('images must be a list of paths or supported URLs.')
     if (operation == 'generate' and images) or (operation != 'generate' and not images):
         raise BackendError('Generate has no input images; reference/edit require images.')
-    extra = spec.get('params', {})
-    if not isinstance(extra, dict):
-        raise BackendError('params must be an object.')
-    extra = merge(config['PARAMS'], extra)
+    extra = request_params(config, spec)
     protected = {'model', 'prompt', 'image', 'images', 'mask', 'subject_reference', 'contents'}
     if protected.intersection(extra) or any(k in extra.get('input', {}) for k in ('prompt', 'messages', 'base_image_url', 'mask_image_url')):
         raise BackendError('Native params cannot override model, prompt, or image inputs.')
-    if extra.get('stream') or extra.get('parameters', {}).get('stream') or extra.get('parameters', {}).get('enable_interleave'):
-        raise BackendError('Streaming/interleaved output is not supported by this adapter.')
+    if extra.get('stream') or extra.get('parameters', {}).get('stream'):
+        raise BackendError('Streaming output is not supported by this adapter.')
+    interleave = extra.get('parameters', {}).get('enable_interleave', False)
+    if interleave and not (protocol == 'dashscope' and config['MODEL'] == 'wan2.6-image'
+                           and config.get('DASHSCOPE_API') == 'multimodal-async'):
+        raise BackendError('Interleaved output is supported only for wan2.6-image multimodal-async; images are saved, text is omitted.')
     headers = {'Authorization': 'Bearer ' + config['API_KEY']}
     body = {'model': config['MODEL'], 'prompt': prompt}
     files = None
-    if mask and not (operation == 'edit' and (protocol == 'openai' or (protocol == 'dashscope' and config.get('DASHSCOPE_API') == 'edit'))):
-        raise BackendError('Explicit masks are only supported by OpenAI edits and DashScope edit profile.')
+    if mask and not (operation == 'edit' and protocol == 'openai'):
+        raise BackendError('Explicit masks are only supported by OpenAI edits.')
     if protocol == 'openai':
         path = '/images/generations' if operation == 'generate' else '/images/edits'
         if images:
@@ -142,19 +170,13 @@ def build_request(config, spec, project):
             if mask:
                 files.append(('mask', local_image(mask, project)))
             # httpx file tuples use name, bytes, content type.
-            files = [(field, (name, data, mime)) for field, (name, mime, data) in files]
+            files = [(field, (f'input-{index:03d}' + {
+                'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp'
+            }[mime], data, mime)) for index, (field, (name, mime, data)) in enumerate(files, 1)]
     elif protocol == 'seedream':
         path = '/images/generations'
         if images:
             body['image'] = [image_uri(x, project) for x in images]
-    elif protocol == 'minimax':
-        path = '/image_generation'
-        if operation == 'edit':
-            raise BackendError('MiniMax supports character reference generation, not generic edits.')
-        if len(images) > 1:
-            raise BackendError('MiniMax adapter accepts one character reference.')
-        if images:
-            body['subject_reference'] = [{'type': 'character', 'image_file': image_uri(images[0], project)}]
     elif protocol == 'gemini':
         headers = {'x-goog-api-key': config['API_KEY']}
         parts = [{'text': prompt}]
@@ -164,23 +186,21 @@ def build_request(config, spec, project):
         path = '/models/' + quote(config['MODEL'], safe='') + ':generateContent'
         body = {'contents': [{'role': 'user', 'parts': parts}], 'generationConfig': {'responseModalities': ['TEXT', 'IMAGE']}}
     else:
-        profile = config.get('DASHSCOPE_API', 'synthesis')
+        profile = config.get('DASHSCOPE_API')
+        if config['MODEL'] == 'wan2.6-image':
+            native = extra.get('parameters', {})
+            if not isinstance(interleave, bool):
+                raise BackendError('enable_interleave must be boolean.')
+            if interleave:
+                if len(images) > 1 or native.get('n', 1) != 1:
+                    raise BackendError('wan2.6 interleave accepts at most one input image and requires n=1.')
+                limit = native.get('max_images', 1)
+                if type(limit) is not int or not 1 <= limit <= 5:
+                    raise BackendError('wan2.6 max_images must be an integer from 1 to 5.')
+            elif not 1 <= len(images) <= 4:
+                raise BackendError('wan2.6-image non-interleaved mode requires 1–4 images; pure text needs explicitly configured multimodal-async.')
         body = {'model': config['MODEL'], 'input': {'prompt': prompt}, 'parameters': {}}
-        if profile == 'synthesis':
-            if images:
-                raise BackendError('DashScope synthesis profile is text-to-image only; choose an approved edit profile.')
-            path = '/services/aigc/text2image/image-synthesis'
-            headers['X-DashScope-Async'] = 'enable'
-        elif profile == 'edit':
-            if len(images) != 1:
-                raise BackendError('DashScope edit profile requires exactly one base image.')
-            body['input']['base_image_url'] = image_uri(images[0], project)
-            body['input']['function'] = 'description_edit_with_mask' if mask else 'description_edit'
-            if mask:
-                body['input']['mask_image_url'] = image_uri(mask, project)
-            path = '/services/aigc/image2image/image-synthesis'
-            headers['X-DashScope-Async'] = 'enable'
-        elif profile in ('multimodal', 'multimodal-async'):
+        if profile in ('multimodal', 'multimodal-async'):
             content = [{'text': prompt}] + [{'image': image_uri(x, project)} for x in images]
             body['input'] = {'messages': [{'role': 'user', 'content': content}]}
             path = '/services/aigc/multimodal-generation/generation'
@@ -188,7 +208,7 @@ def build_request(config, spec, project):
                 path = '/services/aigc/image-generation/generation'
                 headers['X-DashScope-Async'] = 'enable'
         else:
-            raise BackendError('Unknown DashScope profile.')
+            raise BackendError('Choose DashScope multimodal or multimodal-async explicitly; synthesis/edit profiles are retired for new jobs.')
     body = merge(body, extra)
     if files:
         body = {key: (json.dumps(value) if isinstance(value, (dict, list, bool)) else str(value)) for key, value in body.items()}
@@ -208,18 +228,24 @@ def request_json(client, method, url, headers, body=None, files=None):
                 continue
             if response.is_error or response.is_redirect:
                 category = 'authentication' if response.status_code in (401, 403) else 'rate-limit' if response.status_code == 429 else 'request/server'
-                raise BackendError(f'{category} error (HTTP {response.status_code}); response body hidden, no POST retry.')
-            data = response.json()
+                raise BackendError(f'{category} error (HTTP {response.status_code}); response body hidden, no POST retry.', category=category, stage=method, http_status=response.status_code)
+            try:
+                data = response.json()
+            except ValueError:
+                if attempt + 1 < attempts:
+                    time.sleep(2 ** attempt)
+                    continue
+                raise BackendError('Response is not valid JSON; submission may have succeeded. No POST retry.', category='invalid-json', stage=method, http_status=response.status_code) from None
             if not isinstance(data, dict):
-                raise BackendError('Unexpected API response shape.')
+                raise BackendError('Unexpected API response shape.', category='response-shape', stage=method)
             if data.get('error') or data.get('code') or data.get('base_resp', {}).get('status_code', 0) != 0:
-                raise BackendError('Provider reported an error; raw response hidden. Check model, parameters and account console.')
+                raise BackendError('Provider reported an error; raw response hidden. Check model, parameters and account console.', category='provider-error', stage=method)
             return data
-        except (httpx.RequestError, ValueError):
+        except httpx.RequestError as error:
             if attempt + 1 < attempts:
                 time.sleep(2 ** attempt)
                 continue
-            raise BackendError('Network/response failure; submission may have succeeded. Do not blindly resubmit.') from None
+            raise BackendError(f'Network failure ({type(error).__name__}); submission may have succeeded. Do not blindly resubmit.', category=type(error).__name__, stage=method) from None
 
 
 def extract_images(protocol, response):
@@ -230,10 +256,6 @@ def extract_images(protocol, response):
                 result.append({'base64': entry['b64_json']})
             elif entry.get('url'):
                 result.append({'url': entry['url']})
-    elif protocol == 'minimax':
-        data = response.get('data', {})
-        result.extend({'url': x} for x in data.get('image_urls', []))
-        result.extend({'base64': x} for x in data.get('image_base64', []))
     elif protocol == 'gemini':
         for candidate in response.get('candidates', []):
             for part in candidate.get('content', {}).get('parts', []):
@@ -269,7 +291,7 @@ def save_images(results, folder):
                     response.raise_for_status()
                     data = response.content
                 except httpx.HTTPError:
-                    raise BackendError('Image download failed; resume cached results without resubmitting.') from None
+                    raise BackendError('Image download failed; resume cached results without resubmitting.', category='download-failure', stage='download') from None
             try:
                 with Image.open(io.BytesIO(data)) as image:
                     suffix = {'PNG': '.png', 'JPEG': '.jpg', 'WEBP': '.webp'}.get(image.format)
@@ -283,11 +305,11 @@ def save_images(results, folder):
             if path.exists() and path.read_bytes() != data:
                 raise BackendError('Existing result differs; preserve it and choose a separate job.')
             path.write_bytes(data)
-            paths.append({'path': path.name, 'sha256': hashlib.sha256(data).hexdigest()})
+            paths.append({'path': path.name, 'sha256': hashlib.sha256(data).hexdigest(), **image_metadata(path)})
     return paths
 
 
-def execute(config, spec, project, folder, resume=False, wait_seconds=40):
+def _execute(config, spec, project, folder, resume=False, wait_seconds=40):
     folder = Path(folder)
     state_path = folder / 'job.json'
     result_path = folder / 'results.private.json'
@@ -306,7 +328,8 @@ def execute(config, spec, project, folder, resume=False, wait_seconds=40):
     else:
         url, headers, body, files = build_request(config, spec, project)
         folder.mkdir(parents=True, exist_ok=False)
-        state = {'binding': binding(config), 'protocol': config['PROTOCOL'], 'status': 'unknown'}
+        state = {'binding': binding(config), 'protocol': config['PROTOCOL'], 'status': 'unknown',
+                 'expected': output_expectations(config, spec)}
         write_json(state_path, state)
         with httpx.Client(timeout=180, follow_redirects=False) as client:
             response = request_json(client, 'POST', url, headers, body, files)
@@ -320,7 +343,7 @@ def execute(config, spec, project, folder, resume=False, wait_seconds=40):
             if not results:
                 state['status'] = 'failed'
                 write_json(state_path, state)
-                raise BackendError('No final images returned; possible policy/model/response mismatch.')
+                raise BackendError('No final images returned; possible policy/model/response mismatch.', category='missing-images', stage='response')
             write_json(result_path, results)
             state['status'] = 'download'
         write_json(state_path, state)
@@ -334,7 +357,8 @@ def execute(config, spec, project, folder, resume=False, wait_seconds=40):
                 if status == 'SUCCEEDED':
                     results = extract_images('dashscope', response)
                     if not results:
-                        raise BackendError('Task succeeded without readable images.')
+                        raise BackendError('Task succeeded without readable images.',
+                                           category='missing-images', stage='poll-response')
                     write_json(result_path, results)
                     state['status'] = 'download'
                     write_json(state_path, state)
@@ -342,16 +366,86 @@ def execute(config, spec, project, folder, resume=False, wait_seconds=40):
                 if status not in ('PENDING', 'RUNNING'):
                     state['status'] = 'failed'
                     write_json(state_path, state)
-                    raise BackendError('Task failed, was canceled, or is unknown; no resubmission performed.')
+                    category = {'FAILED': 'task-failed', 'CANCELED': 'task-canceled'}.get(
+                        status, 'task-status-unknown')
+                    raise BackendError('Task failed, was canceled, or is unknown; no resubmission performed.',
+                                       category=category, stage='poll-response')
                 if time.monotonic() >= deadline:
                     return state
                 time.sleep(min(10, max(0, deadline - time.monotonic())))
     if state['status'] == 'download':
         state['files'] = save_images(read_json(result_path), folder)
         state['status'] = 'complete'
+        state['validation'] = (validate_outputs(state['expected'], state['files'])
+                               if 'expected' in state else {
+                                   'status': 'not_checked', 'reason': 'legacy_job_without_expectations',
+                                   'visual_review_required': True})
+        state.pop('diagnostic', None)
         write_json(state_path, state)
         result_path.unlink(missing_ok=True)
     return state
+
+
+def image_metadata(path):
+    with Image.open(path) as image:
+        result = {'width': image.width, 'height': image.height, 'format': image.format}
+        if 'A' in image.getbands() or 'transparency' in image.info:
+            alpha = image.convert('RGBA').getchannel('A')
+            result['alpha_range'] = list(alpha.getextrema())
+            result['transparent_fraction'] = alpha.histogram()[0] / (image.width * image.height)
+        else:
+            result['alpha_range'] = None
+        return result
+
+
+def output_expectations(config, spec):
+    params = request_params(config, spec)
+    native = params.get('parameters', {}) if config['PROTOCOL'] == 'dashscope' else params
+    expected = {}
+    size = native.get('size')
+    if isinstance(size, str) and re.fullmatch(r'\d+[x*]\d+', size):
+        expected['size'] = [int(x) for x in re.split('[x*]', size)]
+    if native.get('enable_interleave'):
+        expected['max_count'] = native.get('max_images', 5)
+    elif isinstance(native.get('n'), int) and not isinstance(native['n'], bool):
+        expected['count'] = native['n']
+    if params.get('background') == 'transparent':
+        expected['transparent'] = True
+    return expected
+
+
+def validate_outputs(expected, files):
+    warnings = []
+    if 'count' in expected and len(files) != expected['count']:
+        warnings.append('image_count_mismatch')
+    if 'max_count' in expected and len(files) > expected['max_count']:
+        warnings.append('image_count_exceeds_limit')
+    for item in files:
+        if 'size' in expected and [item.get('width'), item.get('height')] != expected['size']:
+            warnings.append(item['path'] + ':size_mismatch')
+        alpha = item.get('alpha_range')
+        if expected.get('transparent') and (not alpha or alpha[0] == 255):
+            warnings.append(item['path'] + ':missing_transparency')
+    return {'status': 'needs_review' if warnings else 'checks_passed',
+            'warnings': warnings, 'visual_review_required': True}
+
+
+def execute(config, spec, project, folder, resume=False, wait_seconds=40):
+    existed = Path(folder).exists()
+    try:
+        return _execute(config, spec, project, folder, resume, wait_seconds)
+    except BackendError as error:
+        # Never overwrite an existing job on a failed attempt to create a new job.
+        state_path = Path(folder) / 'job.json'
+        if state_path.is_file() and (resume or not existed):
+            state = read_json(state_path)
+            if state.get('binding') == binding(config):
+                # Local resume rejection must not replace a real request failure.
+                if error.diagnostic.get('stage') or 'diagnostic' not in state:
+                    state.setdefault('first_diagnostic', state.get('diagnostic', error.diagnostic))
+                    state['diagnostic'] = error.diagnostic
+                    write_json(state_path, state)
+        raise
 
 
 def main():
