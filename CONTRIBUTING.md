@@ -19,7 +19,7 @@ uv run --locked python -m unittest discover -s anime-pv/scripts/tests -v
 先阅读 [架构约定](docs/ARCHITECTURE.md)。修改尽量对应一个真实问题，不为单个项目的创作偏好添加全局硬规则。保持 SKILL.md 简洁，把模式专属说明放在 references。维护说明留在 skill 文件夹外。
 
 - 协议改动：核对官方接口，为请求、响应和失败恢复增加有意义的离线测试。
-- 工作流改动：用具体场景检查阶段批准、新窗口恢复、局部回改是否仍保留用户意图。
+- 工作流改动：用具体场景检查阶段批准、新窗口恢复、局部回改是否仍保留用户意图；完整制作评测按 [评测方案](docs/skill-evaluation.md) 执行，区分走查和实际运行。
 - 工程改动：保持 pathlib/subprocess 参数列表方式，避免 shell 专属语法进入跨平台脚本。
 - 文档改动：更新相关链接与 CHANGELOG，不把未执行的检查写成通过。
 

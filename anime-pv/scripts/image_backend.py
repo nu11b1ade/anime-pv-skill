@@ -301,22 +301,38 @@ def save_images(results, folder):
             except (OSError, ValueError):
                 raise BackendError('Provider result is not a valid supported image.') from None
             path = Path(folder) / f'image-{index + 1:03d}{suffix}'
-            # A resumed download may replace only identical content, never a modified asset.
-            if path.exists() and path.read_bytes() != data:
-                raise BackendError('Existing result differs; preserve it and choose a separate job.')
-            path.write_bytes(data)
+            # Never overwrite a finished asset. Interrupted writes leave only a .tmp
+            # in this job; a later resume can safely replace that unfinished file.
+            if path.exists():
+                if path.read_bytes() != data:
+                    raise BackendError('Existing result differs; inspect and preserve it before resuming this job. No new submission is needed.',
+                                       category='output-conflict', stage='download')
+            else:
+                temporary = path.with_suffix(path.suffix + '.tmp')
+                try:
+                    temporary.write_bytes(data)
+                    temporary.replace(path)
+                except OSError:
+                    raise BackendError('Image file write failed; resume this job to retry the download without resubmitting.',
+                                       category='image-write-failure', stage='download') from None
             paths.append({'path': path.name, 'sha256': hashlib.sha256(data).hexdigest(), **image_metadata(path)})
     return paths
 
 
-def _execute(config, spec, project, folder, resume=False, wait_seconds=40):
+def _execute(config, spec, project, folder, resume=False, wait_seconds=40, refresh_results=False):
     folder = Path(folder)
     state_path = folder / 'job.json'
     result_path = folder / 'results.private.json'
+    if refresh_results and not resume:
+        raise BackendError('Refreshing results requires --resume; no new submission was made.')
     if resume:
         state = read_json(state_path)
         if state.get('binding') != binding(config):
             raise BackendError('Backend/model/endpoint changed; restore original config before resuming.')
+        if refresh_results and (state.get('status') != 'download'
+                                or config['PROTOCOL'] != 'dashscope'
+                                or not state.get('task_id')):
+            raise BackendError('Refreshing results requires a DashScope task ID and download status; use ordinary resume for pending jobs.')
         if state.get('status') == 'complete':
             for item in state.get('files', []):
                 path = folder / item['path']
@@ -325,6 +341,11 @@ def _execute(config, spec, project, folder, resume=False, wait_seconds=40):
             return state
         if state.get('status') in ('failed', 'unknown'):
             raise BackendError('Job failed or submission is uncertain; inspect account console before creating a new job.')
+        if refresh_results:
+            # Persist the query state first. If GET fails, ordinary resume continues
+            # polling; keep the old private cache until readable new results arrive.
+            state['status'] = 'pending'
+            write_json(state_path, state)
     else:
         url, headers, body, files = build_request(config, spec, project)
         folder.mkdir(parents=True, exist_ok=False)
@@ -430,10 +451,10 @@ def validate_outputs(expected, files):
             'warnings': warnings, 'visual_review_required': True}
 
 
-def execute(config, spec, project, folder, resume=False, wait_seconds=40):
+def execute(config, spec, project, folder, resume=False, wait_seconds=40, refresh_results=False):
     existed = Path(folder).exists()
     try:
-        return _execute(config, spec, project, folder, resume, wait_seconds)
+        return _execute(config, spec, project, folder, resume, wait_seconds, refresh_results)
     except BackendError as error:
         # Never overwrite an existing job on a failed attempt to create a new job.
         state_path = Path(folder) / 'job.json'
@@ -455,8 +476,12 @@ def main():
     parser.add_argument('--request', type=Path, help='JSON request file; paths inside resolve from project')
     parser.add_argument('--job', type=Path, help='New job directory (relative paths resolve from project)')
     parser.add_argument('--resume', action='store_true', help='Resume job without a new POST')
+    parser.add_argument('--refresh-results', action='store_true',
+                        help='With --resume, query a DashScope job in download status for fresh result URLs (GET only)')
     parser.add_argument('--wait-seconds', type=int, default=40, choices=range(0, 51), metavar='0..50')
     args = parser.parse_args()
+    if args.refresh_results and not args.resume:
+        parser.error('--refresh-results requires --resume')
     try:
         config = load_config(args.project)
         if args.check:
@@ -469,7 +494,7 @@ def main():
             raise BackendError('--job and a new --request (or --resume) are required.')
         folder = args.job if args.job.is_absolute() else args.project / args.job
         spec = None if args.resume else read_json(args.request)
-        result = execute(config, spec, args.project, folder, args.resume, args.wait_seconds)
+        result = execute(config, spec, args.project, folder, args.resume, args.wait_seconds, args.refresh_results)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except BackendError as error:
         parser.exit(1, str(error) + '\n')

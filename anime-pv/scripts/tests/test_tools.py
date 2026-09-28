@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,9 +16,9 @@ import image_backend as b
 import project as p
 
 
-def png():
+def png(color='red'):
     stream = io.BytesIO()
-    Image.new('RGB', (2, 2), 'red').save(stream, 'PNG')
+    Image.new('RGB', (2, 2), color).save(stream, 'PNG')
     return stream.getvalue()
 
 
@@ -194,6 +195,189 @@ class ToolsTest(unittest.TestCase):
             wire = request.read()
         self.assertIn(b'filename="input-001.png"', wire)
         self.assertIn(b'filename="input-002.png"', wire)
+
+    def test_refresh_expired_async_results_via_cli(self):
+        cfg = config('dashscope', DASHSCOPE_API='multimodal-async')
+        self.env(self.project, protocol='dashscope', DASHSCOPE_API='multimodal-async')
+        (self.project / 'state').mkdir()
+        b.write_json(self.project / 'state/image-route.json', {
+            'route': 'backend', 'protocol': 'dashscope', 'user_choice': 'Synthetic test choice'})
+        folder = self.project / '.image-jobs/expired'
+        folder.mkdir(parents=True)
+        b.write_json(folder / 'job.json', {'binding': b.binding(cfg),
+            'protocol': 'dashscope', 'status': 'download', 'task_id': 'existing'})
+        b.write_json(folder / 'results.private.json', [{'url': 'https://cdn.test/expired'}])
+        calls = []
+        real_client = httpx.Client
+        def handler(request):
+            calls.append((request.method, request.url.host, request.url.path))
+            if request.url.host == 'api.example.test':
+                self.assertEqual(request.headers['authorization'], 'Bearer test-secret')
+                return httpx.Response(200, json={'output': {'task_status': 'SUCCEEDED',
+                    'results': [{'url': 'https://cdn.test/fresh'}]}})
+            self.assertNotIn('authorization', request.headers)
+            self.assertNotIn('x-goog-api-key', request.headers)
+            return httpx.Response(403) if request.url.path == '/expired' else httpx.Response(200, content=png())
+        def client(**kwargs):
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+        with patch.object(b.httpx, 'Client', side_effect=client):
+            with self.assertRaises(b.BackendError):
+                b.execute(cfg, None, self.project, folder, resume=True)
+            self.assertEqual(b.read_json(folder / 'job.json')['status'], 'download')
+            with patch.object(sys, 'argv', ['image_backend.py', '--project', str(self.project),
+                    '--job', '.image-jobs/expired', '--resume', '--refresh-results']), \
+                    redirect_stdout(io.StringIO()) as output:
+                b.main()
+        result = json.loads(output.getvalue())
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['first_diagnostic']['category'], 'download-failure')
+        self.assertNotIn('diagnostic', result)
+        self.assertEqual(calls, [('GET', 'cdn.test', '/expired'),
+            ('GET', 'api.example.test', '/v1/tasks/existing'), ('GET', 'cdn.test', '/fresh')])
+        self.assertEqual((folder / 'image-001.png').read_bytes(), png())
+        self.assertFalse((folder / 'results.private.json').exists())
+
+    def test_refresh_rejects_ineligible_jobs_without_network_or_state_changes(self):
+        cfg = config('dashscope', DASHSCOPE_API='multimodal-async')
+        cases = [(config(), 'download', 'existing'),
+                 (cfg, 'download', None),
+                 *[(cfg, status, 'existing') for status in ('pending', 'complete', 'failed', 'unknown')]]
+        for index, (current_config, status, task_id) in enumerate(cases):
+            with self.subTest(index=index):
+                folder = self.project / '.image-jobs' / str(index)
+                folder.mkdir(parents=True)
+                state = {'binding': b.binding(current_config), 'status': status,
+                         'task_id': task_id, 'diagnostic': {'category': 'original-error'}}
+                b.write_json(folder / 'job.json', state)
+                with patch.object(b.httpx, 'Client') as network:
+                    with self.assertRaises(b.BackendError):
+                        b.execute(current_config, None, self.project, folder,
+                                  resume=True, refresh_results=True)
+                    network.assert_not_called()
+                self.assertEqual(b.read_json(folder / 'job.json'), state)
+        folder = self.project / '.image-jobs/new'
+        with patch.object(b.httpx, 'Client') as network:
+            with self.assertRaises(b.BackendError):
+                b.execute(cfg, {'prompt': 'PV'}, self.project, folder, refresh_results=True)
+            network.assert_not_called()
+        self.assertFalse(folder.exists())
+        with patch.object(sys, 'argv', ['image_backend.py', '--project', str(self.project),
+                '--job', '.image-jobs/new', '--refresh-results']), \
+                patch.object(b, 'load_config') as load, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                b.main()
+            self.assertEqual(caught.exception.code, 2)
+            load.assert_not_called()
+
+    def test_refresh_query_errors_keep_cache_and_allow_plain_resume(self):
+        cfg = config('dashscope', DASHSCOPE_API='multimodal-async')
+        real_client = httpx.Client
+        for failure, category in [('http', 'authentication'), ('empty', 'missing-images')]:
+            with self.subTest(failure=failure):
+                folder = self.project / '.image-jobs' / failure
+                folder.mkdir(parents=True)
+                first = {'category': 'download-failure', 'stage': 'download'}
+                b.write_json(folder / 'job.json', {'binding': b.binding(cfg),
+                    'status': 'download', 'task_id': 'existing', 'diagnostic': first})
+                cache = [{'url': 'https://cdn.test/expired'}]
+                b.write_json(folder / 'results.private.json', cache)
+                calls = []
+                def handler(request):
+                    calls.append((request.method, request.url.host))
+                    if len(calls) == 1:
+                        return (httpx.Response(401) if failure == 'http' else
+                                httpx.Response(200, json={'output': {'task_status': 'SUCCEEDED'}}))
+                    if request.url.host == 'api.example.test':
+                        return httpx.Response(200, json={'output': {'task_status': 'SUCCEEDED',
+                            'results': [{'url': 'https://cdn.test/fresh'}]}})
+                    self.assertNotIn('authorization', request.headers)
+                    return httpx.Response(200, content=png())
+                def client(**kwargs):
+                    return real_client(transport=httpx.MockTransport(handler), **kwargs)
+                with patch.object(b.httpx, 'Client', side_effect=client):
+                    with self.assertRaises(b.BackendError):
+                        b.execute(cfg, None, self.project, folder, resume=True, refresh_results=True)
+                    state = b.read_json(folder / 'job.json')
+                    self.assertEqual(state['status'], 'pending')
+                    self.assertEqual(state['first_diagnostic'], first)
+                    self.assertEqual(state['diagnostic']['category'], category)
+                    self.assertEqual(b.read_json(folder / 'results.private.json'), cache)
+                    state = b.execute(cfg, None, self.project, folder, resume=True)
+                self.assertEqual(state['status'], 'complete')
+                self.assertEqual(state['first_diagnostic'], first)
+                self.assertEqual(calls, [('GET', 'api.example.test'),
+                    ('GET', 'api.example.test'), ('GET', 'cdn.test')])
+
+    def test_refresh_does_not_overwrite_existing_image_with_different_result(self):
+        cfg = config('dashscope', DASHSCOPE_API='multimodal-async')
+        folder = self.project / '.image-jobs/conflict'
+        folder.mkdir(parents=True)
+        b.write_json(folder / 'job.json', {'binding': b.binding(cfg),
+            'status': 'download', 'task_id': 'existing'})
+        b.write_json(folder / 'results.private.json', [{'url': 'https://cdn.test/expired'}])
+        existing = folder / 'image-001.png'
+        existing.write_bytes(png())
+        calls = []
+        real_client = httpx.Client
+        def handler(request):
+            calls.append(request.method)
+            if request.url.host == 'api.example.test':
+                return httpx.Response(200, json={'output': {'task_status': 'SUCCEEDED',
+                    'results': [{'url': 'https://cdn.test/fresh'}]}})
+            return httpx.Response(200, content=png('blue'))
+        def client(**kwargs):
+            return real_client(transport=httpx.MockTransport(handler), **kwargs)
+        with patch.object(b.httpx, 'Client', side_effect=client):
+            with self.assertRaises(b.BackendError) as caught:
+                b.execute(cfg, None, self.project, folder, resume=True, refresh_results=True)
+        self.assertEqual(caught.exception.diagnostic['category'], 'output-conflict')
+        self.assertEqual(existing.read_bytes(), png())
+        self.assertEqual(b.read_json(folder / 'job.json')['status'], 'download')
+        self.assertTrue((folder / 'results.private.json').exists())
+        self.assertEqual(calls, ['GET', 'GET'])
+
+    def test_interrupted_image_writes_resume_without_resubmitting(self):
+        real_client, real_write, real_replace = httpx.Client, Path.write_bytes, Path.replace
+        images = [png(), png('blue')]
+        response = {'data': [{'b64_json': base64.b64encode(data).decode()} for data in images]}
+        for failure, index in [('write', 1), ('write', 2), ('replace', 1)]:
+            with self.subTest(failure=failure, index=index):
+                folder = self.project / '.image-jobs' / f'{failure}-{index}'
+                temporary_name = f'image-{index:03d}.png.tmp'
+                calls = []
+                def handler(request):
+                    calls.append(request.method)
+                    return httpx.Response(200, json=response)
+                def client(**kwargs):
+                    return real_client(transport=httpx.MockTransport(handler), **kwargs)
+                def interrupted_write(path, data):
+                    if failure == 'write' and path.name == temporary_name:
+                        real_write(path, data[:12])
+                        raise OSError('synthetic private write details')
+                    return real_write(path, data)
+                def interrupted_replace(path, target):
+                    if failure == 'replace' and path.name == temporary_name:
+                        raise OSError('synthetic private replace details')
+                    return real_replace(path, target)
+                with patch.object(b.httpx, 'Client', side_effect=client):
+                    with patch.object(Path, 'write_bytes', interrupted_write), \
+                            patch.object(Path, 'replace', interrupted_replace):
+                        with self.assertRaises(b.BackendError) as caught:
+                            b.execute(config(), {'prompt': 'PV', 'params': {'n': 2}}, self.project, folder)
+                    self.assertEqual(caught.exception.diagnostic['category'], 'image-write-failure')
+                    self.assertNotIn('private', str(caught.exception))
+                    self.assertFalse((folder / f'image-{index:03d}.png').exists())
+                    self.assertTrue((folder / temporary_name).exists())
+                    self.assertEqual(b.read_json(folder / 'job.json')['status'], 'download')
+                    state = b.execute(config(), None, self.project, folder, resume=True)
+                self.assertEqual(state['status'], 'complete')
+                self.assertEqual(state['validation']['status'], 'checks_passed')
+                self.assertEqual(state['first_diagnostic']['category'], 'image-write-failure')
+                self.assertEqual(calls, ['POST'])
+                self.assertFalse(list(folder.glob('*.tmp')))
+                self.assertFalse((folder / 'results.private.json').exists())
+                for image_index, data in enumerate(images, 1):
+                    self.assertEqual((folder / f'image-{image_index:03d}.png').read_bytes(), data)
 
     def test_safe_diagnostics_distinguish_network_and_json(self):
         for expected, handler in [

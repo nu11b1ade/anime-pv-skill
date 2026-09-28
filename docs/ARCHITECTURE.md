@@ -15,6 +15,7 @@
 | 文件位置 | 生成文件默认在项目内，临时内容用 tmp/，缓存用 .cache/；工具强制外部输出需记录并归档所需结果 | 方便迁移及磁盘清理 |
 | 回改 | 保留旧版，仅失效受影响批准项及依赖项 | 局部变化不造成全项目重做 |
 | 工具 | 同等质量下简单、方便、节省 token；不固定引擎或预算 | 把实现和创作判断留给 agent |
+| 制作质量 | 质量目标、轻量镜头记录、素材入镜检查、最终链路样片和可定位缺陷复验 | 首次送审也需自检，阶段批准不掩盖制作缺陷 |
 | 生图 | 用户选择途径与后端后沿用，不能静默切换 | 配置存在不代表选择授权 |
 | 配置 | 项目 → skill → ~/.anime-pv；首个相关 .env 独立完整 | 防止拼接端点和凭证 |
 | 请求恢复 | POST 不自动重试；异步任务查询与下载可独立恢复 | 避免不确定提交导致重复计费 |
@@ -23,18 +24,23 @@
 ## 代码与资源
 
 - `anime-pv/SKILL.md`：发现描述、核心约束、阶段流程和按需引用。
-- `anime-pv/references/`：交接、工程验收、后端协议与验证记录。
+- `anime-pv/references/`：制作质量、交接、工程验收、后端协议与验证记录。
 - `anime-pv/assets/`：项目交接与后端配置模板；不放实际项目素材。
 - `anime-pv/scripts/project.py`：项目初始化、环境预检、ffprobe、显式清单打包。
 - `anime-pv/scripts/image_backend.py`：配置 → 请求组装 → 提交/查询 → 下载与结果校验。
 - `anime-pv/scripts/tests/`：离线回归测试，使用临时目录，不接触真实账户。
 - `tools/check_repo.py`、`.github/workflows/`：仓库结构和链接检查、跨平台 CI。
+- `docs/skill-evaluation.md`：完整 PV 与跨会话行为的维护评测方案；与离线脚本测试分别记录。
 
 ## 生图任务状态
 
 `unknown` 在 POST 前落盘。成功获得异步 ID 后转为 `pending`；同步结果或查询成功后转为 `download`，保存文件与哈希后为 `complete`。失败或无法解析有效输出记为 `failed`（某些网络/响应错误保留 unknown）。恢复 unknown/failed 不会再次 POST。
 
 `job.json` 保存任务 ID、后端绑定与状态，`results.private.json` 临时保存下载结果（可能含签名 URL），下载完成删除。新任务另存expected、实际图片属性和validation；complete只代表落盘完成，needs_review不触发重新提交。first_diagnostic保留首次错误，diagnostic更新最近实际请求错误；本地拒绝恢复不覆盖已有诊断。两者仅包含安全类别、请求阶段和HTTP状态，不保存原始异常或响应。旧任务不回填未知的原始期望。任务缓存不可作为交付素材的唯一位置。最终采用的图片必须复制到版本化 assets。
+
+`--resume --refresh-results` 只适用于带 task ID 的 DashScope download 状态：先持久化 pending，再通过已有查询流程取得新结果，始终不 POST。查询失败保留旧私有缓存并可普通 resume；有效新结果到达后才替换缓存。已有正式图片内容不符时保留并报错，防止刷新结果覆盖采用素材。
+
+图片写入同目录 .tmp 文件后原子替换；中断写入不留下半个正式文件，resume 可重写未完成临时文件。旧版产生的损坏正式文件仍按冲突处理，不自动覆盖人工修改。同一 job 不支持并发操作。
 
 ## 改动影响面
 
