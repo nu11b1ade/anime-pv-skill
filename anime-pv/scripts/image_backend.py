@@ -20,6 +20,7 @@ from PIL import Image
 SKILL = Path(__file__).resolve().parents[1]
 PREFIX = 'ANIME_PV_'
 PROTOCOLS = {'openai', 'gemini', 'seedream', 'dashscope'}
+PROFILE_NAME = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
 
 
 class BackendError(Exception):
@@ -48,10 +49,15 @@ def write_json(path, data):
     temp.replace(path)
 
 
-def load_config(project, skill=SKILL, home=None):
+def load_config(project, skill=SKILL, home=None, profile=None):
     home = Path.home() if home is None else Path(home)
+    if profile == 'default':
+        profile = None
+    if profile is not None and (not PROFILE_NAME.fullmatch(profile) or profile == 'example'):
+        raise BackendError('Profile names use lowercase letters, digits and hyphens; "example" is reserved for the template.')
+    name = '.env' if profile is None else '.env.' + profile
     for root in (Path(project), Path(skill), home / '.anime-pv'):
-        path = root / '.env'
+        path = root / name
         if not path.is_file():
             continue
         # No environment interpolation, export to os.environ, or cross-file merge.
@@ -75,14 +81,30 @@ def load_config(project, skill=SKILL, home=None):
             raise BackendError('ANIME_PV_PARAMS must contain a JSON object.') from None
         if not isinstance(values['PARAMS'], dict):
             raise BackendError('ANIME_PV_PARAMS must contain a JSON object.')
+        values['PROFILE'] = profile or 'default'
         values['SOURCE'] = str(path.resolve())
         return values
-    raise BackendError('No relevant .env found in project, skill, or ~/.anime-pv.')
+    raise BackendError(f'No relevant {name} found in project, skill, or ~/.anime-pv.')
 
 
 def binding(config):
     public = {k: config.get(k) for k in ('PROTOCOL', 'ENDPOINT', 'MODEL', 'DASHSCOPE_API')}
     return hashlib.sha256(json.dumps(public, sort_keys=True).encode()).hexdigest()
+
+
+def route_authorizes(route, config):
+    """True when state/image-route.json records user authorization for this profile."""
+    if not isinstance(route, dict) or not isinstance(route.get('user_choice'), str) or not route['user_choice'].strip():
+        return False
+    # A legacy single-route file authorizes only the default profile.
+    entries = route.get('routes') if 'routes' in route else [route]
+    for entry in entries if isinstance(entries, list) else []:
+        if (isinstance(entry, dict) and entry.get('route') == 'backend'
+                and entry.get('profile', 'default') == config.get('PROFILE', 'default')
+                and entry.get('protocol') == config['PROTOCOL']
+                and entry.get('model') in (None, config['MODEL'])):
+            return True
+    return False
 
 
 def local_image(value, project):
@@ -238,7 +260,9 @@ def request_json(client, method, url, headers, body=None, files=None):
                 raise BackendError('Response is not valid JSON; submission may have succeeded. No POST retry.', category='invalid-json', stage=method, http_status=response.status_code) from None
             if not isinstance(data, dict):
                 raise BackendError('Unexpected API response shape.', category='response-shape', stage=method)
-            if data.get('error') or data.get('code') or data.get('base_resp', {}).get('status_code', 0) != 0:
+            # Some gateways add a success "code" beside the payload; never discard a response carrying results.
+            payload = any(data.get(key) for key in ('data', 'output', 'candidates'))
+            if data.get('error') or (data.get('code') and not payload):
                 raise BackendError('Provider reported an error; raw response hidden. Check model, parameters and account console.', category='provider-error', stage=method)
             return data
         except httpx.RequestError as error:
@@ -251,23 +275,25 @@ def request_json(client, method, url, headers, body=None, files=None):
 def extract_images(protocol, response):
     result = []
     if protocol in ('openai', 'seedream'):
-        for entry in response.get('data', []):
+        for entry in response.get('data') or []:
+            if not isinstance(entry, dict):
+                continue
             if entry.get('b64_json'):
                 result.append({'base64': entry['b64_json']})
             elif entry.get('url'):
                 result.append({'url': entry['url']})
     elif protocol == 'gemini':
-        for candidate in response.get('candidates', []):
-            for part in candidate.get('content', {}).get('parts', []):
-                inline = part.get('inlineData', part.get('inline_data', {}))
+        for candidate in response.get('candidates') or []:
+            for part in (candidate.get('content') or {}).get('parts') or []:
+                inline = part.get('inlineData') or part.get('inline_data') or {}
                 if not part.get('thought') and inline.get('data'):
                     result.append({'base64': inline['data']})
     else:
-        output = response.get('output', {})
-        result.extend({'url': x['url']} for x in output.get('results', []) if x.get('url'))
-        for choice in output.get('choices', []):
-            for part in choice.get('message', {}).get('content', []):
-                if part.get('image'):
+        output = response.get('output') or {}
+        result.extend({'url': x['url']} for x in output.get('results') or [] if isinstance(x, dict) and x.get('url'))
+        for choice in output.get('choices') or []:
+            for part in (choice.get('message') or {}).get('content') or []:
+                if isinstance(part, dict) and part.get('image'):
                     result.append({'url': part['image']})
     return result
 
@@ -319,7 +345,12 @@ def save_images(results, folder):
     return paths
 
 
-def _execute(config, spec, project, folder, resume=False, wait_seconds=40, refresh_results=False):
+def same_profile(state, config):
+    # Jobs created before profiles existed carry no profile and resume under any matching binding.
+    return state.get('profile', config.get('PROFILE', 'default')) == config.get('PROFILE', 'default')
+
+
+def _execute(config, spec, project, folder, resume=False, wait_seconds=40, refresh_results=False, request_timeout=600):
     folder = Path(folder)
     state_path = folder / 'job.json'
     result_path = folder / 'results.private.json'
@@ -327,6 +358,9 @@ def _execute(config, spec, project, folder, resume=False, wait_seconds=40, refre
         raise BackendError('Refreshing results requires --resume; no new submission was made.')
     if resume:
         state = read_json(state_path)
+        if not same_profile(state, config):
+            raise BackendError(f'Job was created with profile "{state["profile"]}"; resume with --profile {state["profile"]}.',
+                               category='profile-mismatch')
         if state.get('binding') != binding(config):
             raise BackendError('Backend/model/endpoint changed; restore original config before resuming.')
         if refresh_results and (state.get('status') != 'download'
@@ -349,10 +383,12 @@ def _execute(config, spec, project, folder, resume=False, wait_seconds=40, refre
     else:
         url, headers, body, files = build_request(config, spec, project)
         folder.mkdir(parents=True, exist_ok=False)
-        state = {'binding': binding(config), 'protocol': config['PROTOCOL'], 'status': 'unknown',
+        state = {'binding': binding(config), 'profile': config.get('PROFILE', 'default'),
+                 'protocol': config['PROTOCOL'], 'status': 'unknown',
                  'expected': output_expectations(config, spec)}
         write_json(state_path, state)
-        with httpx.Client(timeout=180, follow_redirects=False) as client:
+        # Synchronous generation can take minutes; a premature read timeout loses a possibly billed result.
+        with httpx.Client(timeout=httpx.Timeout(request_timeout, connect=30), follow_redirects=False) as client:
             response = request_json(client, 'POST', url, headers, body, files)
         task = response.get('output', {}).get('task_id')
         if task:
@@ -451,16 +487,16 @@ def validate_outputs(expected, files):
             'warnings': warnings, 'visual_review_required': True}
 
 
-def execute(config, spec, project, folder, resume=False, wait_seconds=40, refresh_results=False):
+def execute(config, spec, project, folder, resume=False, wait_seconds=40, refresh_results=False, request_timeout=600):
     existed = Path(folder).exists()
     try:
-        return _execute(config, spec, project, folder, resume, wait_seconds, refresh_results)
+        return _execute(config, spec, project, folder, resume, wait_seconds, refresh_results, request_timeout)
     except BackendError as error:
         # Never overwrite an existing job on a failed attempt to create a new job.
         state_path = Path(folder) / 'job.json'
         if state_path.is_file() and (resume or not existed):
             state = read_json(state_path)
-            if state.get('binding') == binding(config):
+            if state.get('binding') == binding(config) and same_profile(state, config):
                 # Local resume rejection must not replace a real request failure.
                 if error.diagnostic.get('stage') or 'diagnostic' not in state:
                     state.setdefault('first_diagnostic', state.get('diagnostic', error.diagnostic))
@@ -469,9 +505,19 @@ def execute(config, spec, project, folder, resume=False, wait_seconds=40, refres
         raise
 
 
+def bounded_seconds(low, high):
+    def parse(text):
+        value = int(text)
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError(f'must be {low}..{high}')
+        return value
+    return parse
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--project', type=Path, required=True)
+    parser.add_argument('--profile', help='Backend profile: reads .env.<profile> instead of .env (default profile)')
     parser.add_argument('--check', action='store_true', help='Validate config only; no network/key output')
     parser.add_argument('--request', type=Path, help='JSON request file; paths inside resolve from project')
     parser.add_argument('--job', type=Path, help='New job directory (relative paths resolve from project)')
@@ -479,22 +525,25 @@ def main():
     parser.add_argument('--refresh-results', action='store_true',
                         help='With --resume, query a DashScope job in download status for fresh result URLs (GET only)')
     parser.add_argument('--wait-seconds', type=int, default=40, choices=range(0, 51), metavar='0..50')
+    parser.add_argument('--request-timeout', type=bounded_seconds(30, 1800), default=600, metavar='30..1800',
+                        help='Read/write timeout of the single POST; keep the calling command timeout longer')
     args = parser.parse_args()
     if args.refresh_results and not args.resume:
         parser.error('--refresh-results requires --resume')
     try:
-        config = load_config(args.project)
+        config = load_config(args.project, profile=args.profile)
         if args.check:
-            print(json.dumps({'source': config['SOURCE'], 'protocol': config['PROTOCOL'], 'model': config['MODEL'], 'configuration_valid': True, 'network_tested': False}, ensure_ascii=False))
+            print(json.dumps({'source': config['SOURCE'], 'profile': config['PROFILE'], 'protocol': config['PROTOCOL'], 'model': config['MODEL'], 'configuration_valid': True, 'network_tested': False}, ensure_ascii=False))
             return
         route = read_json(args.project / 'state/image-route.json')
-        if route.get('route') != 'backend' or route.get('protocol') != config['PROTOCOL'] or not route.get('user_choice'):
-            raise BackendError('Record the user-selected backend route/protocol and choice evidence in state/image-route.json first.')
+        if not route_authorizes(route, config):
+            raise BackendError('Record the user-authorized backend profile/protocol and choice evidence in state/image-route.json first.')
         if args.job is None or (not args.resume and args.request is None):
             raise BackendError('--job and a new --request (or --resume) are required.')
         folder = args.job if args.job.is_absolute() else args.project / args.job
         spec = None if args.resume else read_json(args.request)
-        result = execute(config, spec, args.project, folder, args.resume, args.wait_seconds, args.refresh_results)
+        result = execute(config, spec, args.project, folder, args.resume, args.wait_seconds, args.refresh_results,
+                         args.request_timeout)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except BackendError as error:
         parser.exit(1, str(error) + '\n')

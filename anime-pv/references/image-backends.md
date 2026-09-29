@@ -1,18 +1,20 @@
 # 生图途径与后端
 
-仅首次需要生图时读取本文件。用户先明确选择内置生图或后端 API；选择写入交接，项目内沿用。内置工具不可用时报告，不自行切换 API；反之亦然。后端、端点或协议更换同样不能擅自进行。
+首次需要生图时读取本文件。用户先明确授权生图途径：agent 可用的内置或 MCP 生图工具、一个或多个后端 profile，可以一次授权多个。授权写入交接，项目内沿用；授权范围内按素材择优。授权的途径不可用时报告，不自行改用未授权的途径、后端、端点或协议。
 
 ## 选择之前
 
-先读 [三方中转与最低能力建议](gateway-guidance.md)。完整创作路径至少需要文生图、单图参考、两张以上参考合成与指令编辑；协议名或模型名不能代替实测。精确尺寸、原生透明和独立mask按项目需求验证，不把内置同样存在的规格偏差当作模型画质不足。
+使用三方中转时先读 [三方中转与最低能力建议](gateway-guidance.md)。完整创作路径至少需要文生图、单图参考、两张以上参考合成与指令编辑；授权多个途径时按组合覆盖评估。协议名或模型名不能代替实测。精确尺寸、原生透明和独立 mask 按项目需求验证，不把内置同样存在的规格偏差当作模型画质不足。
 
-已移除 MiniMax 主体参考适配，以及 DashScope synthesis/edit 旧 profile：这些旧路径只覆盖角色参考、纯文生图或单图编辑，不满足此skill完整创作路径的多参考与通用编辑要求。这是适配范围取舍，不是对整个厂商能力的评价。旧配置不会自动切换；MiniMax旧任务请用原版本检查/取回，已保存图片可继续使用。DashScope旧任务在原配置下仍可resume查询/下载，只有新建旧profile任务被拒绝；新项目明确选择新profile和对应模型。
+旧版 MiniMax 适配已移除。DashScope synthesis/edit 旧 profile 只保留原配置下旧任务的 resume 查询与下载；新任务须明确选择 multimodal 或 multimodal-async。
 
 ## 配置查找
 
 脚本依次读取项目根目录 `.env` → skill 根目录 `.env` → `~/.anime-pv/.env`（Windows 为用户主目录中的 `.anime-pv`）。首个含 `ANIME_PV_` 配置的文件为完整来源；缺项即报错，无关 `.env` 继续查找。不合并文件、不从进程环境补 key、不展开变量。复制 [配置模板](../assets/backend.env.example) 并填写，真实 `.env` 不进入版本库或交付包。
 
-必填：`ANIME_PV_PROTOCOL`、`ANIME_PV_ENDPOINT`、`ANIME_PV_API_KEY`、`ANIME_PV_MODEL`。模型不默认写死；按用户账户和所需能力选定。端点是带版本的 API 基址，不是完整操作 URL，不可带密钥/查询参数。`ANIME_PV_PARAMS` 为可选 JSON 请求体参数对象，请求文件 params 在该对象上深度覆盖。两者都不能覆盖模型、提示词和图像输入。保留平台原生参数，不把尺寸、参考图能力强行统一。
+多个后端各用一个 profile 文件：加 `--profile <名称>` 时按同一顺序查找 `.env.<名称>`，规则相同，互不合并。名称只用小写字母、数字和连字符；`default` 即 `.env`，`example` 保留给模板。
+
+必填：`ANIME_PV_PROTOCOL`、`ANIME_PV_ENDPOINT`、`ANIME_PV_API_KEY`、`ANIME_PV_MODEL`。模型不默认写死；按用户账户和所需能力选定。端点是带版本的 API 基址，不是完整操作 URL，不可带密钥/查询参数。`ANIME_PV_PARAMS` 为可选 JSON 请求体参数对象，请求文件 params 在该对象上深度覆盖。两者都不能覆盖模型、提示词和图像输入。保留平台原生参数，不把尺寸、参考图能力强行统一；身份/输入保真类参数（如部分 OpenAI 编辑模型的 `input_fidelity`）也作为原生参数传入，按所选模型官方文档使用。
 
 | 协议 | 基址示例 | 适配范围及边界 |
 | --- | --- | --- |
@@ -37,14 +39,16 @@ DashScope 必须用 `ANIME_PV_DASHSCOPE_API` 明确选择，没有默认 profile
 安装依赖由 `uv run` 根据脚本头完成，无需全局 pip。先只做配置检查，不联网，也不输出 key：
 
 ```sh
-uv run <skill>/scripts/image_backend.py --project <项目> --check
+uv run <skill>/scripts/image_backend.py --project <项目> [--profile <名称>] --check
 ```
 
-用户已选 API 后，agent 在 `state/image-route.json` 记录真实选择依据（不可自行编造）：
+用户授权后，agent 在 `state/image-route.json` 记录真实授权依据（不可自行编造）。每个后端条目写明 profile 与协议，可选 `model` 把授权限定到具体模型；内置或 MCP 工具也列出，便于交接，脚本只核对后端条目：
 
 ```json
-{"route":"backend","protocol":"openai","user_choice":"用户在本轮明确选择 OpenAI API；具体证据由 agent 填写"}
+{"routes":[{"route":"builtin"},{"route":"backend","profile":"default","protocol":"openai"},{"route":"backend","profile":"gemini","protocol":"gemini"}],"user_choice":"用户本轮授权的途径与原话摘要；具体证据由 agent 填写"}
 ```
+
+旧的单一格式 `{"route":"backend","protocol":"openai","user_choice":"…"}` 仍然有效，只授权 default profile。脚本在提交前核对当前 profile 与协议是否在授权内。
 
 创建请求 JSON；保存到项目以便复现，不将 key 或带签名的 URL 写入请求。图像路径相对于项目根目录；命令行 request 文件路径相对于当前工作目录。
 
@@ -63,13 +67,13 @@ mask 仅用于 OpenAI 编辑；其余平台省略。OpenAI/Gemini 的 images 接
 Gemini 原生参数示例为 `{"generationConfig":{"imageConfig":{"aspectRatio":"16:9"}}}`；DashScope 为 `{"parameters":{"size":"1024*1024","n":1}}`；Seedream 为 `{"size":"2K"}`。这些值需匹配具体模型。
 
 ```sh
-uv run <skill>/scripts/image_backend.py --project <项目> --request <项目>/state/request-v1.json --job .image-jobs/character-v1
-uv run <skill>/scripts/image_backend.py --project <项目> --job .image-jobs/character-v1 --resume
+uv run <skill>/scripts/image_backend.py --project <项目> [--profile <名称>] --request <项目>/state/request-v1.json --job .image-jobs/character-v1
+uv run <skill>/scripts/image_backend.py --project <项目> [--profile <名称>] --job .image-jobs/character-v1 --resume
 ```
 
 OpenAI 多参考图使用标准重复 `image[]` 字段，上传文件自动分配唯一ASCII名称，避免不同目录同名素材在中转层冲突；不会改动本地原图。
 
-每次新提交使用全新 job 目录。轮询默认约 40 秒后返回 pending，agent 更新进展后用 resume 查询；单次网络请求仍可能超过此时长。同步生图可能耗时数分钟。将最终选用图片复制到版本化 assets 路径，记录提示词、非敏感模型参数及 job ID；交接不依赖缓存。已完成任务 resume 会校验输出哈希。
+每次新提交使用全新 job 目录；job 记录创建时的 profile，resume 须使用同一 `--profile`。POST 读写超时默认 600 秒（`--request-timeout 30..1800`），同步生图可能耗时数分钟。在 agent 中运行时，命令自身的超时必须长于它，或改为后台运行并在结束后读取 job 状态；进程被外部终止会留下 unknown 任务，已付费结果可能无法取回。轮询默认约 40 秒后返回 pending，agent 更新进展后用 resume 查询。不同 job 可以并行提交以比较变体；同一 job 不并发。将最终选用图片复制到版本化 assets 路径，记录途径/profile、提示词、非敏感模型参数及 job ID；交接不依赖缓存。已完成任务 resume 会校验输出哈希。
 
 ## 输出验收
 
@@ -84,7 +88,7 @@ OpenAI 多参考图使用标准重复 `image[]` 字段，上传文件自动分�
 - 异步任务 ID 在开始查询前落盘。pending 可恢复；failed/canceled/unknown 不自动重生。GET 短暂错误最多三次有限重试。
 - 下载失败保留私有结果缓存；resume 只重下结果，不再 POST。临时 URL 可能过期，过期后先查询任务；同步接口无任务查询则报告限制，不能承诺永久恢复。
 - job 目录下 results.private.json 可能含有签名 URL，禁止展示、写交接或打包；下载完成即删除。默认 `.image-jobs/` 已忽略。HTTP 原始错误与鉴权头不写日志，CDN 下载使用不带平台鉴权的独立客户端。
-- 有 key 仅表示配置齐备，不表示用户选择已完成、账号可用或模型支持。首次真实验证优先使用代表性任务，避免为了“测试连接”无必要生成素材。
+- 有 key 仅表示配置齐备，不表示用户授权已完成、账号可用或模型支持；配置检查不等于联网成功，联网成功也不等于创作验收通过。首次真实验证优先使用代表性任务，避免为了“测试连接”无必要生成素材。
 
 异步 DashScope 任务已到 `download`，但缓存的下载链接疑似失效时，显式刷新同一任务的结果：
 
@@ -98,11 +102,11 @@ uv run <skill>/scripts/image_backend.py --project <项目> --job .image-jobs/cha
 
 ## 官方协议依据
 
-2026-09-27 复核 OpenAI、Gemini、万相与 MiniMax 文档；Seedream 文档本轮页面未完整加载，保留既有适配，未新增真实验证。模型和服务可能变动，遇到能力或协议不符先查官方文档；不把这些链接整篇加载进上下文。
+2026-09-27 复核 OpenAI、Gemini 与万相文档；Seedream 文档当时页面未完整加载，保留既有适配。模型和服务可能变动，遇到能力或协议不符先查官方文档；不把这些链接整篇加载进上下文。
 
 - [OpenAI Images 编辑接口](https://developers.openai.com/api/reference/resources/images/methods/edit)
 - [Gemini 图像生成](https://ai.google.dev/gemini-api/docs/image-generation)
 - [火山方舟图像生成 API](https://docs.volcengine.com/docs/ark/image-generation-api?lang=en)
 - [万相文生图 V2](https://help.aliyun.com/zh/model-studio/text-to-image-v2-api-reference)、[图像编辑](https://help.aliyun.com/zh/model-studio/wanx-image-edit-api-reference)、[图像生成与编辑](https://help.aliyun.com/zh/model-studio/wan-image-generation-api-reference)
 
-实际验证状态见 [验证记录](validation.md)。离线协议测试不能替代账户、地区、模型与真实输出质量验证。
+已实测的只有用户选择的 OpenAI 兼容三方中转（配置模型名 gpt-image-2）和 Codex 内置生图；其余协议只有离线测试。离线协议测试不能替代账户、地区、模型与真实输出质量验证，首次真实使用时以代表性任务验证。

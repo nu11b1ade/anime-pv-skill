@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -40,9 +41,9 @@ class ToolsTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def env(self, root, **values):
+    def env(self, root, name='.env', **values):
         values = config(**values)
-        (root / '.env').write_text('\n'.join('ANIME_PV_' + k + '=' + (json.dumps(v) if isinstance(v, dict) else v) for k, v in values.items()), encoding='utf-8')
+        (root / name).write_text('\n'.join('ANIME_PV_' + k + '=' + (json.dumps(v) if isinstance(v, dict) else v) for k, v in values.items()), encoding='utf-8')
 
     def test_config_priority_unrelated_and_incomplete(self):
         self.env(self.skill)
@@ -532,6 +533,129 @@ class ToolsTest(unittest.TestCase):
                             b.execute(cfg, None, self.project, folder, resume=True)
                         self.assertEqual(b.read_json(folder / 'job.json'), state)
                         self.assertEqual(calls, ['GET'] * 4)
+
+    def test_profiles_select_complete_env_files(self):
+        self.env(self.project)
+        self.env(self.home / '.anime-pv', '.env.relay-b', protocol='gemini')
+        selected = b.load_config(self.project, self.skill, self.home, profile='relay-b')
+        self.assertEqual((selected['PROTOCOL'], selected['PROFILE']), ('gemini', 'relay-b'))
+        for profile in (None, 'default'):
+            selected = b.load_config(self.project, self.skill, self.home, profile=profile)
+            self.assertEqual((selected['PROTOCOL'], selected['PROFILE']), ('openai', 'default'))
+        for profile in ('example', '../x', 'Upper', '', 'missing'):
+            with self.subTest(profile=profile), self.assertRaises(b.BackendError):
+                b.load_config(self.project, self.skill, self.home, profile=profile)
+
+    def test_route_file_authorizes_listed_profiles_only(self):
+        current = {**config(), 'PROFILE': 'default'}
+        relay = {**config('gemini'), 'PROFILE': 'relay-b'}
+        legacy = {'route': 'backend', 'protocol': 'openai', 'user_choice': 'User chose the OpenAI API'}
+        self.assertTrue(b.route_authorizes(legacy, current))
+        self.assertFalse(b.route_authorizes(legacy, relay))
+        self.assertFalse(b.route_authorizes({**legacy, 'user_choice': ' '}, current))
+        routes = {'user_choice': 'User authorized built-in and two backends', 'routes': [
+            {'route': 'builtin'},
+            {'route': 'backend', 'profile': 'default', 'protocol': 'openai'},
+            {'route': 'backend', 'profile': 'relay-b', 'protocol': 'gemini', 'model': 'test-image'}]}
+        self.assertTrue(b.route_authorizes(routes, current))
+        self.assertTrue(b.route_authorizes(routes, relay))
+        self.assertFalse(b.route_authorizes(routes, {**relay, 'MODEL': 'other-model'}))
+        self.assertFalse(b.route_authorizes(routes, {**config('seedream'), 'PROFILE': 'other'}))
+
+    def test_cli_rejects_unauthorized_profile_before_network(self):
+        self.env(self.project, '.env.relay-b', protocol='gemini')
+        (self.project / 'state').mkdir()
+        b.write_json(self.project / 'state/image-route.json',
+                     {'route': 'backend', 'protocol': 'gemini', 'user_choice': 'Legacy file: default profile only'})
+        b.write_json(self.project / 'state/request.json', {'prompt': 'PV'})
+        argv = ['image_backend.py', '--project', str(self.project), '--profile', 'relay-b',
+                '--request', str(self.project / 'state/request.json'), '--job', '.image-jobs/blocked']
+        with patch.object(sys, 'argv', argv), patch.object(b.httpx, 'Client') as network, \
+                redirect_stderr(io.StringIO()) as error:
+            with self.assertRaises(SystemExit) as caught:
+                b.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertIn('image-route.json', error.getvalue())
+        network.assert_not_called()
+        self.assertFalse((self.project / '.image-jobs/blocked').exists())
+        with patch.object(sys, 'argv', ['image_backend.py', '--project', str(self.project), '--profile', 'relay-b', '--check']), \
+                redirect_stdout(io.StringIO()) as output:
+            b.main()
+        self.assertEqual(json.loads(output.getvalue())['profile'], 'relay-b')
+
+    def test_job_profile_is_recorded_and_required_on_resume(self):
+        folder = self.project / '.image-jobs/profiled'
+        relay = {**config(), 'PROFILE': 'relay-b'}
+        response = {'data': [{'b64_json': base64.b64encode(png()).decode()}]}
+        with patch.object(b, 'request_json', return_value=response):
+            state = b.execute(relay, {'prompt': 'PV'}, self.project, folder)
+        self.assertEqual(state['profile'], 'relay-b')
+        with self.assertRaises(b.BackendError) as caught:
+            b.execute({**config(), 'PROFILE': 'default'}, None, self.project, folder, True)
+        self.assertEqual(caught.exception.diagnostic['category'], 'profile-mismatch')
+        self.assertIn('--profile relay-b', str(caught.exception))
+        self.assertEqual(b.read_json(folder / 'job.json'), state)
+        self.assertEqual(b.execute(relay, None, self.project, folder, True)['status'], 'complete')
+
+    def test_request_timeout_reaches_post_client_and_is_bounded(self):
+        timeouts = []
+        real_client = httpx.Client
+        payload = {'data': [{'b64_json': base64.b64encode(png()).decode()}]}
+        def client(**kwargs):
+            timeouts.append(kwargs['timeout'])
+            return real_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)), **kwargs)
+        with patch.object(b.httpx, 'Client', side_effect=client):
+            b.execute(config(), {'prompt': 'PV'}, self.project, self.project / '.image-jobs/slow', request_timeout=900)
+        self.assertEqual((timeouts[0].read, timeouts[0].write, timeouts[0].connect), (900, 900, 30))
+        with patch.object(sys, 'argv', ['image_backend.py', '--project', str(self.project), '--check', '--request-timeout', '5']), \
+                patch.object(b, 'load_config') as load, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                b.main()
+        self.assertEqual(caught.exception.code, 2)
+        load.assert_not_called()
+
+    def test_results_are_kept_when_gateways_add_success_codes(self):
+        image = {'b64_json': 'YWJj'}
+        cases = [({'code': 200, 'msg': 'success', 'data': [image]}, None),
+                 ({'base_resp': None, 'data': [image]}, None),
+                 ({'code': 'InvalidApiKey', 'message': 'hidden'}, 'provider-error'),
+                 ({'code': 500, 'data': None}, 'provider-error'),
+                 ({'error': {'message': 'hidden'}, 'data': [image]}, 'provider-error')]
+        for body, category in cases:
+            with self.subTest(body=body), httpx.Client(transport=httpx.MockTransport(
+                    lambda request, body=body: httpx.Response(200, json=body))) as client:
+                if category is None:
+                    self.assertEqual(b.request_json(client, 'POST', 'https://api.test', {}, {}), body)
+                else:
+                    with self.assertRaises(b.BackendError) as caught:
+                        b.request_json(client, 'POST', 'https://api.test', {}, {})
+                    self.assertEqual(caught.exception.diagnostic['category'], category)
+        self.assertEqual(b.extract_images('openai', {'code': 200, 'data': [image]}), [{'base64': 'YWJj'}])
+        for protocol, body in (('openai', {'data': None}), ('dashscope', {'output': None}), ('gemini', {'candidates': None})):
+            self.assertEqual(b.extract_images(protocol, body), [])
+
+    def test_preflight_reports_route_capabilities(self):
+        paths = {'ffmpeg': '/bin/ffmpeg', 'ffprobe': '/bin/ffprobe', 'fc-list': '/bin/fc-list'}
+        listings = {'-encoders': 'Encoders:\n V..... = Video\n ------\n V....D libx264  H.264\n A....D aac  AAC\n',
+                    '-filters': 'Filters:\n  T.. = Timeline support\n TSC xfade  VV->V  Cross fade\n T.. showinfo  V->V  Info\n'}
+        def run(command, **kwargs):
+            if command[0] == '/bin/fc-list':
+                output = 'Noto Sans CJK SC,Noto Sans CJK\nSource Han Sans\\-SC\n' if command[1] == ':lang=zh' else ''
+            else:
+                output = listings.get(command[-1], 'ffmpeg version 9.0\n')
+            return subprocess.CompletedProcess(command, 0, output, '')
+        with patch.object(p.shutil, 'which', side_effect=paths.get), patch.object(p.subprocess, 'run', side_effect=run), \
+                patch.object(p, 'FULL_FFMPEG', ()), patch.object(p, 'find_browser', return_value=None):
+            report = p.preflight()
+        capabilities = report['ffmpeg_capabilities']['ffmpeg']
+        self.assertTrue(capabilities['encoders']['libx264'])
+        self.assertFalse(capabilities['encoders']['libx265'])
+        self.assertEqual((capabilities['filters']['xfade'], capabilities['filters']['drawtext']), (True, False))
+        self.assertEqual(report['fonts']['zh'], {'families': 2, 'examples': ['Noto Sans CJK SC', 'Source Han Sans-SC']})
+        self.assertEqual(report['fonts']['ja']['families'], 0)
+        self.assertTrue(any('drawtext' in note for note in report['notes']))
+        self.assertIsNone(report['tools']['blender']['path'])
+        self.assertEqual(report['local_ai'], 'not started')
 
     def test_init_and_package_portable_files(self):
         (self.project / '.gitignore').write_text('user-rule\n', encoding='utf-8')

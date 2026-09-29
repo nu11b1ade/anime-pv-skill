@@ -5,6 +5,7 @@
 """Portable PV project helpers; no shell execution or model installation."""
 import argparse
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -13,6 +14,11 @@ import zipfile
 from pathlib import Path
 
 SKILL = Path(__file__).resolve().parents[1]
+ENCODERS = ('libx264', 'libx265', 'libsvtav1', 'prores_ks', 'ffv1', 'aac')
+FILTERS = ('drawtext', 'subtitles', 'ass', 'zscale', 'libvmaf', 'xfade', 'scdet', 'blackdetect', 'freezedetect', 'showinfo')
+# Homebrew's core ffmpeg omits freetype/libass/zimg; ffmpeg-full is keg-only and must be called by path.
+FULL_FFMPEG = ('/opt/homebrew/opt/ffmpeg-full/bin/ffmpeg', '/usr/local/opt/ffmpeg-full/bin/ffmpeg')
+BROWSERS = ('chromium', 'chromium-browser', 'google-chrome', 'google-chrome-stable', 'chrome', 'msedge')
 
 
 def init_project(root, mode):
@@ -35,28 +41,90 @@ def init_project(root, mode):
     return {'handoff': str(target), 'stage': 1, 'approved': False}
 
 
+def output_of(command, timeout=20):
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, errors='replace')
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def tool_version(path, flag):
+    try:
+        result = subprocess.run([path, flag], capture_output=True, text=True, timeout=10, errors='replace')
+        return (result.stdout or result.stderr).splitlines()[0]
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return 'present; version check failed'
+
+
+def ffmpeg_capabilities(path):
+    listed = {}
+    for kind in ('encoders', 'filters'):
+        output = output_of([path, '-hide_banner', '-' + kind])
+        if output is None:
+            return {'checked': False}
+        listed[kind] = {line.split()[1] for line in output.splitlines() if len(line.split()) >= 2}
+    return {'checked': True,
+            'encoders': {name: name in listed['encoders'] for name in ENCODERS},
+            'filters': {name: name in listed['filters'] for name in FILTERS}}
+
+
+def cjk_fonts():
+    fc_list = shutil.which('fc-list')
+    if not fc_list:
+        return {'checked': False, 'reason': 'fc-list unavailable; verify fonts with the chosen renderer'}
+    result = {'checked': True}
+    for lang in ('zh', 'ja'):
+        output = output_of([fc_list, ':lang=' + lang, 'family']) or ''
+        families = sorted({line.split(',')[0].replace('\\-', '-').strip() for line in output.splitlines() if line.strip()})
+        result[lang] = {'families': len(families), 'examples': families[:5]}
+    return result
+
+
+def find_browser():
+    for name in BROWSERS:
+        path = shutil.which(name)
+        if path:
+            return path
+    candidates = [Path('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+                  Path('/Applications/Chromium.app/Contents/MacOS/Chromium')]
+    for variable in ('PROGRAMFILES', 'PROGRAMFILES(X86)', 'LOCALAPPDATA'):
+        if os.environ.get(variable):
+            candidates.append(Path(os.environ[variable]) / 'Google/Chrome/Application/chrome.exe')
+    return next((str(path) for path in candidates if path.is_file()), None)
+
+
 def preflight():
     system = platform.system()
-    names = ('uv', 'ffmpeg', 'ffprobe', 'node', 'magick')
+    names = ('uv', 'ffmpeg', 'ffprobe', 'node', 'npx', 'magick', 'blender')
     tools = {}
     for name in names:
         path = shutil.which(name)
-        version = None
-        if path:
-            try:
-                flag = '-version' if name in ('ffmpeg', 'ffprobe', 'magick') else '--version'
-                result = subprocess.run([path, flag], capture_output=True, text=True, timeout=10, errors='replace')
-                version = (result.stdout or result.stderr).splitlines()[0]
-            except (OSError, subprocess.TimeoutExpired, IndexError):
-                version = 'present; version check failed'
+        version = tool_version(path, '-version' if name in ('ffmpeg', 'ffprobe', 'magick') else '--version') if path else None
         tools[name] = {'path': path, 'version': version, 'required_for': 'media inspection/rendering' if name.startswith('ff') else 'route-dependent'}
+    full = next((path for path in FULL_FFMPEG if Path(path).is_file()), None)
+    if full:
+        tools['ffmpeg-full'] = {'path': full, 'version': tool_version(full, '-version'), 'required_for': 'optional full-feature ffmpeg; call by path'}
+    capabilities = {name: ffmpeg_capabilities(tools[name]['path']) for name in ('ffmpeg', 'ffmpeg-full') if tools.get(name, {}).get('path')}
+    notes = []
+    missing = [name for name in ('drawtext', 'subtitles', 'ass') if capabilities.get('ffmpeg', {}).get('filters', {}).get(name) is False]
+    if missing:
+        if full:
+            remedy = 'or call the detected ffmpeg-full binary by its path'
+        elif system == 'Darwin':
+            remedy = 'or brew install ffmpeg-full (keg-only) and call $(brew --prefix ffmpeg-full)/bin/ffmpeg explicitly without changing global PATH'
+        else:
+            remedy = 'or install an ffmpeg build with freetype/libass'
+        notes.append('PATH ffmpeg lacks ' + ', '.join(missing) + ': render text as Pillow/browser/vector layers, ' + remedy + '.')
     if system in ('Darwin', 'Linux'):
-        install = 'If Homebrew is available: brew install uv ffmpeg; install node/imagemagick only if the chosen renderer needs them. Linux without Homebrew: use the distribution package manager or official installers.'
+        install = 'If Homebrew is available: brew install uv ffmpeg; install node/imagemagick/blender only if the chosen renderer needs them. Linux without Homebrew: use the distribution package manager or official installers.'
     elif system == 'Windows':
-        install = 'PowerShell: winget install --id astral-sh.uv -e; winget install --id Gyan.FFmpeg -e. Reopen the terminal after PATH changes. Install Node.js/ImageMagick only when selected.'
+        install = 'PowerShell: winget install --id astral-sh.uv -e; winget install --id Gyan.FFmpeg -e. Reopen the terminal after PATH changes. Install Node.js/ImageMagick/Blender only when selected.'
     else:
         install = 'Use official installers appropriate for this platform.'
-    return {'system': system, 'machine': platform.machine(), 'python': sys.version.split()[0], 'tools': tools, 'installation_hint': install, 'renderer_smoke_test': 'not performed', 'local_ai': 'not started'}
+    return {'system': system, 'machine': platform.machine(), 'python': sys.version.split()[0], 'tools': tools,
+            'ffmpeg_capabilities': capabilities, 'fonts': cjk_fonts(), 'browser': find_browser(), 'notes': notes,
+            'installation_hint': install, 'renderer_smoke_test': 'not performed', 'local_ai': 'not started'}
 
 
 def probe(path):

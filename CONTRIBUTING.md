@@ -2,7 +2,7 @@
 
 ## 开发环境
 
-使用 uv 管理 Python 和依赖；适用时使用 Homebrew 安装工具。Java 仅在选定的制作工具确实需要时使用，并用 jenv 管理。离线测试不需要 ffmpeg、Node.js、API key 或本地 AI 模型。
+使用 uv 管理 Python 和依赖；适用时使用 Homebrew 安装工具。Java 仅在选定的制作工具确实需要时使用，并用 jenv 管理。离线测试不需要 Node.js、API key 或本地 AI 模型；media.py 的集成测试需要 ffmpeg/ffprobe，缺少时自动跳过。
 
 在仓库根目录执行：
 
