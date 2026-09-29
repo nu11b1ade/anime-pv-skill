@@ -60,12 +60,15 @@ class MediaLogicTest(unittest.TestCase):
         changed = (timebase, [packets[0], (0, 21, 350, 'xxx'), packets[2]])
         status, detail = m.compare_packets(reference, changed, 0.0, 0.0, 1 / 24)
         self.assertEqual((status, detail['first_mismatch']), ('fail', 1))
+        self.assertNotIn('hint', detail)
         # Same payload, video now starts 21 ms earlier relative to audio: sub-frame shift needs review.
         status, detail = m.compare_packets(reference, reference, 0.021, 0.0, 1 / 24)
         self.assertEqual(status, 'review')
         self.assertAlmostEqual(detail['sync_offset_delta_seconds'], 0.021)
-        status, _ = m.compare_packets(reference, reference, 0.1, 0.0, 1 / 24)
+        self.assertIn('-itsoffset 0.021000 before the rendered video input', detail['hint'])
+        status, detail = m.compare_packets(reference, reference, 0.0, 0.1, 1 / 24)
         self.assertEqual(status, 'fail')
+        self.assertIn('-itsoffset 0.100000 before the reference audio input', detail['hint'])
 
     def test_cut_matching_and_shot_stats(self):
         matched, missing, extra = m.match_cuts([1.0, 2.0], [1.04, 3.0], 1 / 24)
@@ -99,18 +102,30 @@ class MediaIntegrationTest(unittest.TestCase):
         cls.dir = Path(cls.temp.name)
         cls.ref, cls.silent = cls.dir / 'ref.mkv', cls.dir / '成片-silent.mkv'
         cls.final, cls.reencoded, cls.shifted = (cls.dir / name for name in ('final.mkv', 'reencoded.mkv', 'shifted.mkv'))
-        # Animated source with a hard cut at 1.0 s to an inverted copy, plus AAC audio.
+        # Animated source with a hard cut at 1.0 s to an inverted copy. FLAC has no encoder priming, so
+        # every ffmpeg version muxes this reference with video and audio both starting at zero.
         cls.ffmpeg('-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=24:d=1', '-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=24:d=1,negate',
                    '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
                    '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]', '-map', '2:a',
-                   '-c:v', 'ffv1', '-c:a', 'aac', '-b:a', '96k', cls.ref)
+                   '-c:v', 'ffv1', '-c:a', 'flac', cls.ref)
         cls.ffmpeg('-i', cls.ref, '-map', '0:v', '-c:v', 'mpeg4', '-q:v', '4', cls.silent)
         # The documented replica mux: silent render video plus stream-copied reference audio.
-        cls.ffmpeg('-i', cls.silent, '-i', cls.ref, '-map', '0:v:0', '-map', '1:a?', '-c:v', 'copy', '-c:a', 'copy', cls.final)
+        cls.mux(cls.silent, cls.ref, cls.final)
         cls.ffmpeg('-i', cls.silent, '-i', cls.ref, '-map', '0:v:0', '-map', '1:a', '-c:v', 'copy',
                    '-c:a', 'aac', '-b:a', '64k', cls.reencoded)
-        cls.ffmpeg('-i', cls.silent, '-itsoffset', '0.1', '-i', cls.ref, '-map', '0:v:0', '-map', '1:a',
-                   '-c', 'copy', cls.shifted)
+        cls.mux(cls.silent, cls.ref, cls.shifted, audio_offset=0.1)
+        # References whose video starts after the audio: AAC priming (how much depends on the ffmpeg
+        # version's muxer) and an explicit late video start.
+        cls.offset_cases = {}
+        for name, video_input, audio in (
+                ('aac', ['-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=24:d=2'], ['-c:a', 'aac', '-b:a', '96k']),
+                ('late', ['-itsoffset', '0.05', '-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=24:d=2'], ['-c:a', 'flac'])):
+            ref, silent, final = (cls.dir / f'{name}-{kind}.mkv' for kind in ('ref', 'silent', 'final'))
+            cls.ffmpeg(*video_input, '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=2',
+                       '-map', '0:v', '-map', '1:a', '-c:v', 'ffv1', *audio, ref)
+            cls.ffmpeg('-i', ref, '-map', '0:v', '-c:v', 'mpeg4', '-q:v', '4', silent)
+            cls.mux(silent, ref, final)
+            cls.offset_cases[name] = (ref, silent, final)
 
     @classmethod
     def tearDownClass(cls):
@@ -119,6 +134,13 @@ class MediaIntegrationTest(unittest.TestCase):
     @staticmethod
     def ffmpeg(*args):
         subprocess.run([shutil.which('ffmpeg'), '-hide_banner', '-v', 'error', '-y', *map(str, args)], check=True)
+
+    @classmethod
+    def mux(cls, video, reference, output, video_offset=0.0, audio_offset=0.0):
+        # Stream-copy mux; an -itsoffset before an input delays that input's timestamps.
+        cls.ffmpeg(*(['-itsoffset', f'{video_offset:.6f}'] if video_offset else []), '-i', video,
+                   *(['-itsoffset', f'{audio_offset:.6f}'] if audio_offset else []), '-i', reference,
+                   '-map', '0:v:0', '-map', '1:a?', '-c', 'copy', output)
 
     @staticmethod
     def audio(result):
@@ -158,6 +180,21 @@ class MediaIntegrationTest(unittest.TestCase):
         audio = self.audio(m.verify(self.shifted, self.ref, 'copy'))
         self.assertEqual(audio['status'], 'fail')
         self.assertAlmostEqual(audio['detail']['streams'][0]['sync_offset_delta_seconds'], 0.1, delta=0.002)
+
+    def test_start_offsets_are_reported_and_correctable(self):
+        for name, (ref, silent, final) in self.offset_cases.items():
+            with self.subTest(case=name):
+                stream = self.audio(m.verify(final, ref, 'copy'))['detail']['streams'][0]
+                self.assertTrue(stream['identical_payload'])
+                shift = stream['sync_offset_delta_seconds']
+                if name == 'late':
+                    self.assertGreater(shift, 0.03)
+                if abs(shift) > m.TIMING_TOLERANCE:
+                    self.assertIn('-itsoffset', stream['hint'])
+                # Apply the documented correction and verify again.
+                fixed = self.dir / f'{name}-fixed.mkv'
+                self.mux(silent, ref, fixed, video_offset=max(shift, 0), audio_offset=max(-shift, 0))
+                self.assertEqual(self.audio(m.verify(fixed, ref, 'copy'))['status'], 'pass')
 
     def test_expected_silence(self):
         self.assertEqual(self.audio(m.verify(self.silent, expect_audio='none'))['status'], 'pass')

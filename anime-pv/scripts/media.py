@@ -435,13 +435,15 @@ def compare_packets(ref, out, ref_video_start, video_start, frame_step):
     detail['duration_delta_seconds'] = round(end - (float((ref_packets[-1][0] + ref_packets[-1][1]) * ref_tb) - ref_start), 6)
     deviation = max(abs((float(p[0] * tb) - start) - (float(r[0] * ref_tb) - ref_start)) for p, r in zip(packets, ref_packets))
     detail['max_timing_deviation_seconds'] = round(deviation, 6)
+    if abs(sync) > TIMING_TOLERANCE:
+        # A reference whose video starts after its audio (AAC priming, container offsets) loses that
+        # offset when the render is muxed from zero; shifting the right input restores the original sync.
+        target = 'rendered video input' if sync > 0 else 'reference audio input'
+        detail['hint'] = (f'A/V offset differs from the reference by {sync:+.6f} s, often from encoder priming or a '
+                          f'container start offset. Remux with -itsoffset {abs(sync):.6f} before the {target}, then verify again.')
     if not identical or deviation > TIMING_TOLERANCE or abs(sync) > frame_step:
         return 'fail', detail
-    if abs(sync) > TIMING_TOLERANCE:
-        detail['hint'] = ('Sub-frame sync shift, often encoder priming or a container start offset; '
-                          'align the video timestamps if exact replica timing is required.')
-        return 'review', detail
-    return 'pass', detail
+    return ('review' if abs(sync) > TIMING_TOLERANCE else 'pass'), detail
 
 
 def audio_copy_check(video, info, times, reference, ref_info, ref_times, ref_stream):

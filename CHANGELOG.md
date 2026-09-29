@@ -15,6 +15,7 @@
 ### 修复
 
 - 生图 POST 读写超时由固定 180 秒改为 `--request-timeout`（默认 600 秒，30–1800）；文档提醒 agent 的命令超时须长于它或改为后台运行，避免同步生图被中断后变成 unknown、已付费结果无法取回。
+- 复刻混流：原片视频起点晚于音频时（如 AAC 预滚动使封装整体平移，Ubuntu 的 ffmpeg 6.1 即如此），文档中的简单混流命令会把渲染视频归零，造成与原片不同的音画偏移。media.py verify 报告偏移值并给出 `-itsoffset` 修正方向，production.md 同步说明；媒体测试改用不依赖 ffmpeg 版本的夹具，并验证修正后逐包一致。
 - 响应判错不再因中转在成功响应中附带 `code` 字段而丢弃含图片的结果；移除 MiniMax 遗留的 `base_resp` 检查（`null` 时会触发未处理异常）；结果提取容忍 `data: null` 等空载荷。
 
 - DashScope 下载任务新增显式 --resume --refresh-results，通过已有 task ID 查询新结果链接；查询失败可普通恢复，始终不重新 POST，已有正式素材不被覆盖。

@@ -35,7 +35,7 @@ uv run <skill>/scripts/project.py probe <参考视频>
 ffmpeg -i silent-render.mkv -i reference.mkv -map 0:v:0 -map 1:a? -c:v copy -c:a copy final.mkv
 ```
 
-不要默认加 -shortest 截断尾部，也不要为了 MP4 把音频转成 AAC。按要求保留音轨数量、顺序、语言/默认标记和同步偏移，必要时显式设置 metadata/disposition。容器能否承载原音频必须预检。无原音轨则不添加音轨。核查保存具体命令、输入/输出流信息，并按音轨比较编码数据包内容及时间关系：`uv run <skill>/scripts/media.py verify <成片> --reference <原片> --expect-audio copy` 逐轨比对包的大小与哈希、起点、时长和音画相对偏移，并报告语言/默认标记差异。报告亚帧级同步偏移时（常见于编码器预滚动或容器起点），按需调整视频时间戳。容器头不同不能用整文件哈希代替音轨核查。
+不要默认加 -shortest 截断尾部，也不要为了 MP4 把音频转成 AAC。按要求保留音轨数量、顺序、语言/默认标记和同步偏移，必要时显式设置 metadata/disposition。容器能否承载原音频必须预检。无原音轨则不添加音轨。核查保存具体命令、输入/输出流信息，并按音轨比较编码数据包内容及时间关系：`uv run <skill>/scripts/media.py verify <成片> --reference <原片> --expect-audio copy` 逐轨比对包的大小与哈希、起点、时长和音画相对偏移，并报告语言/默认标记差异。原片视频起点晚于音频时（常见于 AAC 编码器预滚动或封装起点平移），上面的简单命令会把渲染视频归零，造成与原片不同的音画偏移。verify 会报告 `sync_offset_delta_seconds`：值为正时在渲染视频输入前加 `-itsoffset <该值>`，为负时在原片输入前加 `-itsoffset <绝对值>`，重新混流后复验。容器头不同不能用整文件哈希代替音轨核查。
 
 ## 三层验收
 
